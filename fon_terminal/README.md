@@ -1,84 +1,94 @@
-# TEFAS Fund Data Scraper & Terminal
+# TEFAS Fund Tracker (Fon Terminali) v4.0
 
-Automated extraction and visualization of daily mutual fund metrics and asset allocation data from [TEFAS](https://www.tefas.gov.tr) (Turkish Electronic Fund Trading Platform), the official registry operated by the Capital Markets Board of Turkey (SPK).
+An automated, robust financial dashboard and data pipeline for tracking Turkish mutual fund asset distributions via the TEFAS (Turkish Electronic Fund Trading Platform) API.
 
-The project has two parts: a Python scraper that builds a historical fund database, and a static HTML dashboard that reads that database and renders it as an interactive, multi-fund terminal.
+This project goes beyond simple data retrieval. It features a hybrid web-scraping/API architecture designed to seamlessly bypass enterprise-grade Web Application Firewalls (WAF) and a meticulously crafted UI that gracefully handles complex, edge-case financial data.
 
-## Project Overview
+## Project Overview & Architecture Evolution
 
-TEFAS publishes fund-level data—price, total net asset value, share count, investor count, and asset distribution—on dynamically rendered fund analysis pages. This data is useful for portfolio tracking and downstream analysis, but it is not exposed through a stable public API. Direct HTTP requests to fund detail URLs are frequently blocked by the site's F5 BIG-IP Web Application Firewall (WAF).
+**Legacy vs. v4.0 Architecture:**
+Earlier iterations of this pipeline relied on traditional HTML DOM parsing. While functional, DOM scraping is inherently fragile and susceptible to unannounced frontend UI updates by TEFAS. v4.0 represents a complete architectural shift: moving away from UI-dependent scraping to a direct API interception model. By targeting the underlying Next.js backend, this evolution drastically reduced execution time, eliminated DOM-related breakage, and established a resilient, enterprise-grade data pipeline.
 
-TEFAS's newer Next.js-based fund data page also protects its internal `/api/funds/` backend with a dynamically issued `Authorization: Bearer` session token and browser cookies, so plain `requests.post()` calls are rejected outright. `data_scraper.py` solves this with a hybrid approach: a headless Playwright browser performs a one-time "handshake"—loading the fund data page just long enough to intercept a real outgoing API request and capture its Bearer token and cookies—then immediately closes. Those credentials are injected into a `requests.Session()`, which is used to make fast, direct POST requests to the general-info and portfolio-distribution endpoints for every configured fund. Each run merges the fetched data for the last 30 days per fund into a single master database (`fund_database.json`), preserving all historical records.
+TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), which is highly valuable for portfolio tracking. However, it is not exposed through a stable public API. The core engineering challenges overcome in this v4.0 architecture include:
 
-`index.html` is a self-contained dashboard that loads `fund_database.json` via `fetch` and presents it as a dark-mode terminal with per-fund tabs, KPI cards, a daily manager-activity report, a zebra-striped data table, and price/volume/asset-allocation charts. It requires no build step or backend—only a static file server.
+### 1. The F5 BIG-IP WAF & Dynamic Token Challenge
 
-## Features
+**The Problem:** Direct HTTP requests to fund detail URLs are blocked by the site's F5 BIG-IP WAF. Furthermore, TEFAS's Next.js-based frontend protects its internal `/api/funds/` backend with dynamically issued `Authorization: Bearer` session tokens and browser cookies.
 
-**Scraper (`data_scraper.py`)**
-- Hybrid architecture: a one-time headless Playwright handshake captures a live Bearer token and session cookies, then a plain `requests.Session()` handles all subsequent API calls for speed
-- Calls TEFAS's internal `fonGnlBlgSiraliGetirT` (general info) and `dagilimSiraliGetirT` (portfolio distribution) endpoints directly, fetching the last 30 days of data per fund in each run
-- Merges general info and portfolio distribution records by date, preserving raw asset names exactly as returned by the API
-- Correctly parses both plain and Turkish-formatted numeric strings, including negative values (e.g. net Repo positions)
-- Configurable fund list (`target_funds`); default targets: `TLY`, `PHE`, `YAS`
-- Upserts into `fund_database.json`, grouped by fund code: existing dates are overwritten with fresh data (auto-correcting any historical revisions from TEFAS), new dates are inserted, and the fund's record list is kept chronologically sorted
-- Per-fund error handling (HTTP status checks, JSON validation) so one fund's failure doesn't abort the run
+**The Solution:** Implemented a **hybrid authentication approach**. A headless `Playwright` browser performs a one-time "handshake"—loading the page just long enough to intercept a real outgoing API request, capturing the `Bearer` token and cookies. It then closes, injecting those credentials into a fast `requests.Session()` to execute direct, bulk POST requests.
 
-**Dashboard (`index.html`)**
-- Tabbed navigation to switch between funds; adding a new fund only requires appending its code to `FUND_CODES` in the script
-- Fully automated data loading via `fetch('fund_database.json')`—no manual data entry required
-- Graceful fallback with an on-screen status banner if the database file is missing or empty
-- KPI cards for current price, total fund size, and daily share-count changes ("Balina Radarı" whale-activity indicator)
-- Automated daily report summarizing which asset allocations increased or decreased
-- Filterable, zebra-striped data table (last 7 / 10 / 14 days or full history) with per-cell day-over-day change badges
-- Price trend + moving average chart, share-count vs. investor-count chart, and a grid of isolated mini-charts per asset type
-- Dark mode throughout
+### 2. Handling Incomplete Financial Data
+
+**The Problem:** Financial data is inherently messy. Some funds (like the Qualified/Free fund `YAS`) are restricted from sharing daily distributions, while others (like `PHE`) might temporarily liquidate a specific asset, causing that key to vanish from the API response entirely.
+
+**The Solution:** Engineered a robust validation layer. If an asset is completely sold off, the UI intelligently defaults to `0.00%` rather than throwing `undefined` errors. For fully restricted funds, a dual-layer logging system alerts the backend terminal, while the frontend gracefully displays a muted `-` indicator to maintain visual UI harmony.
+
+### 3. Sub-Pixel Rendering & UI Matrix
+
+**The Problem:** The complex data table required simultaneous vertical and horizontal sticky scrolling, which caused browser sub-pixel rendering issues resulting in text "bleeding" through headers.
+
+**The Solution:** Designed a precise CSS matrix using strict `z-index` layering (up to `z-index: 20` for origin corners) and a `top: -1px` physical offset to crush the browser rendering gap, achieving a flawless, zero-bleed scrolling experience in a dark-mode environment.
+
+## Key Features
+
+**Backend (`data_scraper.py`)**
+- **Hybrid Extraction:** Captures live tokens via Playwright, then handles bulk API calls via Python `requests` for speed.
+- **Historical Merging:** Upserts into `fund_database.json`, grouping by fund code. Existing dates are overwritten (auto-correcting TEFAS revisions), and new dates are inserted chronologically.
+- **Fault Tolerance:** Per-fund error handling ensures one fund's failure doesn't abort the entire daily run.
+
+**Frontend (`index.html`)**
+- **Zero-Build Dashboard:** Fully automated loading via `fetch('fund_database.json')`—no framework or manual data entry required.
+- **Advanced Analytics:** KPI cards, daily share-count changes ("Balina Radarı" / Whale Radar), and an automated daily report summarizing asset allocation shifts.
+- **Interactive Visuals:** Zebra-striped data tables with day-over-day change badges, price trend charts, and asset-type mini-charts via Chart.js.
 
 ## Tech Stack
 
-| Component | Purpose |
-|-----------|---------|
-| Python 3 | Scraper runtime |
-| [Playwright](https://playwright.dev/python/) | One-time headless browser handshake to capture the TEFAS session token/cookies |
-| [Requests](https://requests.readthedocs.io/) | Fast, direct POST calls to the TEFAS backend API using the captured session |
-| HTML / CSS / vanilla JavaScript | Dashboard front end (no framework, no build step) |
-| [Chart.js](https://www.chartjs.org/) (via CDN) | Charting |
+- **Backend:** Python 3.9+, Playwright, Requests
+- **Frontend:** HTML5, Vanilla JavaScript, CSS3 (Custom Dark Theme)
+- **Charting:** Chart.js (via CDN)
 
-## How to Run
+## Installation & Usage
 
 ### Prerequisites
 
 - Python 3.9+
 
-### Installation
+### Setup
 
 ```bash
 git clone <repository-url>
 cd fon_terminal
 
+# Create and activate virtual environment
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
+# Install dependencies
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-The `playwright install chromium` step downloads the headless browser binary Playwright needs for the one-time authentication handshake; it only needs to be run once per environment.
+(Note: `playwright install chromium` downloads the headless browser binary for the handshake; it runs only once per environment).
 
-### Running the scraper
+### Running the Scraper
 
-Edit the `target_funds` list in `data_scraper.py` to specify which fund codes to track:
+Edit the `target_funds` list in `data_scraper.py` (default: `TLY`, `PHE`, `YAS`):
 
 ```python
 target_funds = ["TLY", "PHE", "YAS"]
 ```
 
-Run it:
+Run the scraper:
 
 ```bash
 python data_scraper.py
 ```
 
-Each run fetches the latest data for every configured fund and merges it into `fund_database.json` in the working directory. The file groups records by fund code:
+Tip: Schedule this script to run daily via cron or Task Scheduler to keep the local `fund_database.json` up to date.
+
+## Data Schema
+
+Each run merges the latest data into `fund_database.json`, grouped by fund code, with each fund's records kept in chronological order:
 
 ```json
 {
@@ -95,24 +105,20 @@ Each run fetches the latest data for every configured fund and merges it into `f
 | `Pay` | Shares outstanding |
 | `ToplamDeger` | Total fund net asset value (TRY) |
 | `Yatirimci` | Number of investors |
-| `PazarPayi` | Fund's market share (%) |
-| `Varliklar` | Asset type → allocation percentage (can include negative values, e.g. net Repo) |
+| `Varliklar` | Asset type → allocation percentage (can include negative values, e.g. net Repo; keys are translated from raw TEFAS abbreviations to full names) |
 
-Schedule `data_scraper.py` to run daily (e.g. via Task Scheduler or cron) to keep the database up to date; the dashboard requires no changes when new data is added.
+### Running the Dashboard
 
-### Running the dashboard
-
-Because the dashboard loads `fund_database.json` via `fetch`, it must be served over HTTP rather than opened directly as a `file://` path. From the project directory:
+Because the dashboard uses the Fetch API, it must be served over HTTP:
 
 ```bash
 python -m http.server 8000
 ```
 
-Then open `http://localhost:8000/index.html` in a browser.
+Then open `http://localhost:8000/index.html` in your browser.
 
-### Notes
+## Troubleshooting & Notes
 
-- Each run launches a headless Chromium instance briefly (a few seconds) just to capture a valid Bearer token and session cookies from TEFAS; it closes immediately afterward, and the rest of the run uses fast direct HTTP requests.
-- If you see `[ERROR] [HANDSHAKE] Failed to capture Authorization token`, TEFAS may have changed its authentication flow, or the page took longer than expected to fire an API request—check `acquire_session_credentials()` in `data_scraper.py`.
-- If a fund's requests return `HTTP 401`/`403`, the captured token was rejected or expired mid-run; simply re-run the script to perform a fresh handshake.
-- `fund_database.json` is treated as local, environment-specific data and is excluded via `.gitignore`; each environment builds its own copy by running the scraper.
+- **Handshake Errors:** If you see `[ERROR] [HANDSHAKE] Failed to capture Authorization token`, TEFAS may have updated its flow. Check `acquire_session_credentials()` in `data_scraper.py`.
+- **401/403 Status:** If the captured token expires mid-run, simply re-run the script for a fresh token.
+- **Data Privacy:** `fund_database.json` is treated as local environment data and is ignored via `.gitignore`.
