@@ -22,9 +22,9 @@ TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), wh
 
 ### 2. Handling Incomplete Financial Data
 
-**The Problem:** Financial data is inherently messy. Some funds (like the Qualified/Free fund `YAS`) are restricted from sharing daily distributions, while others (like `PHE`) might temporarily liquidate a specific asset, causing that key to vanish from the API response entirely.
+**The Problem:** Financial data pipelines are inherently subject to upstream API inconsistencies. Due to platform-side quirks on TEFAS, certain funds (like `YAS`) do not return distribution data through the bulk search endpoints. Additionally, funds (like `PHE`) might temporarily liquidate a specific asset, causing that asset's key to vanish from the API response entirely.
 
-**The Solution:** Engineered a robust validation layer. If an asset is completely sold off, the UI intelligently defaults to `0.00%` rather than throwing `undefined` errors. For fully restricted funds, a dual-layer logging system alerts the backend terminal, while the frontend gracefully displays a muted `-` indicator to maintain visual UI harmony.
+**The Solution:** Engineered a robust validation layer. If an asset is completely sold off and missing from the payload, the UI intelligently defaults to `0.00%` rather than throwing `undefined` errors. For funds that return empty datasets from the TEFAS API, a dual-layer logging system alerts the backend terminal, while the frontend gracefully displays a muted `-` indicator to maintain visual UI harmony without breaking the application state.
 
 ### 3. Sub-Pixel Rendering & UI Matrix
 
