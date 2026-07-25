@@ -45,6 +45,15 @@ TEFAS_DISTRIBUTION_MAP = {
     "yyf": "Yatırım Fonları Katılma Payları",
     "vint": "Vadeli İşlemler Nakit Teminatları",
     "bpp": "Borsa İstanbul Para Piyasası",
+    "yhs": "Yabancı Hisse Senedi",
+    "byf": "Borsa Yatırım Fonları Katılma Payları",
+    "kibd": "Döviz Cinsi Kamu İç Borçlanma Araçları",
+    "dt": "Devlet Tahvili",
+    "khtl": "Katılma Hesabı (TL)",
+    "kkstl": "Kamu Kira Sertifikaları (TL)",
+    "ost": "Özel Sektör Tahvili",
+    "vdm": "Varlığa Dayalı Menkul Kıymetler",
+    "tpp": "Borsa İstanbul Para Piyasası",
 }
 
 
@@ -249,7 +258,7 @@ def acquire_session_credentials(
         # now that the WAF challenge and correct endpoints/payloads have
         # been diagnosed via visual/recon debugging.
         browser = playwright.chromium.launch(
-            headless=True,
+            headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
         try:
@@ -510,13 +519,56 @@ def merge_fund_data(general_map, distribution_map):
 
 
 # --- Local database (fund_database.json) persistence ------------------------
+#
+# Each fund entry is stored as {"_metadata": {...}, "records": [...]} so
+# funds can be hidden from the UI ("show_on_ui": false) while optionally
+# still being refreshed occasionally in the background ("background_tracking":
+# true) without losing their historical "records", tracked via
+# "last_scraped_date" (YYYY-MM-DD). Older database files predate this
+# metadata wrapper and store a bare list of records per fund directly; that
+# legacy shape is transparently upgraded on every load (see
+# `ensure_fund_entry_shape`) so no separate one-off migration is needed.
+
+def default_metadata():
+    """Fresh metadata for a fund that has never been given explicit
+    show/track settings: visible on the UI, not background-tracked, and
+    never (yet) scraped.
+    """
+    return {"show_on_ui": True, "background_tracking": False, "last_scraped_date": None}
+
+
+def ensure_fund_entry_shape(entry):
+    """Normalizes a single fund's database entry into the current
+    {"_metadata": {...}, "records": [...]} shape, upgrading the legacy
+    format (a bare list of daily records with no metadata) on the fly.
+    """
+    if isinstance(entry, list):
+        return {"_metadata": default_metadata(), "records": entry}
+
+    if isinstance(entry, dict):
+        metadata = default_metadata()
+        metadata.update(entry.get("_metadata") or {})
+        records = entry.get("records")
+        return {"_metadata": metadata, "records": records if isinstance(records, list) else []}
+
+    return {"_metadata": default_metadata(), "records": []}
+
 
 def load_database():
-    """Loads the master fund database, or returns an empty dict if missing."""
-    if os.path.exists(DATABASE_FILE):
-        with open(DATABASE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    return {}
+    """Loads the master fund database, or returns an empty dict if missing.
+
+    Every fund entry is passed through `ensure_fund_entry_shape` so legacy
+    (pre-metadata) entries are upgraded transparently as soon as they're
+    read, without requiring a separate migration pass.
+    """
+    if not os.path.exists(DATABASE_FILE):
+        return {}
+    with open(DATABASE_FILE, "r", encoding="utf-8") as file:
+        raw_database = json.load(file)
+    return {
+        fund_code: ensure_fund_entry_shape(entry)
+        for fund_code, entry in raw_database.items()
+    }
 
 
 def save_database(database):
@@ -539,9 +591,10 @@ def upsert_fund_record(database, fund_code, new_record):
     Returns "inserted" or "updated" for logging purposes.
     """
     if fund_code not in database:
-        database[fund_code] = []
+        database[fund_code] = ensure_fund_entry_shape(None)
 
-    records = database[fund_code]
+    entry = database[fund_code]
+    records = entry["records"]
     existing_index = next(
         (i for i, record in enumerate(records) if record.get("Tarih") == new_record["Tarih"]),
         -1,
@@ -554,34 +607,53 @@ def upsert_fund_record(database, fund_code, new_record):
         records.append(new_record)
         action = "inserted"
 
-    database[fund_code] = sort_fund_records(records)
+    entry["records"] = sort_fund_records(records)
+    database[fund_code] = entry
     return action
 
 
-# --- Main -------------------------------------------------------------------
+# --- Reusable pipeline entry point -------------------------------------------
 
-if __name__ == "__main__":
-    print("[SYSTEM] Initializing TEFAS API Data Scraper (hybrid mode)...")
+def scrape_and_update(fund_list, days_back=30):
+    """Runs the full hybrid scraping pipeline (Playwright WAF handshake +
+    bulk `requests` API calls, completely unchanged from the standalone CLI
+    flow) for the given fund codes, merging freshly fetched data into
+    `fund_database.json`.
 
-    target_funds = ["TLY", "PHE", "YAS"]
+    This is the single reusable entry point shared by the CLI (`python
+    data_scraper.py`) and by the FastAPI `/api/add-fund` endpoint in
+    `main.py`, which calls it on demand for one newly requested fund code.
+
+    Returns a dict keyed by (uppercased) fund code, e.g.:
+        {
+            "TLY": {"status": "success", "inserted": 2, "updated": 28},
+            "XYZ": {"status": "error", "message": "No general info retrieved..."},
+        }
+
+    Raises RuntimeError if the Playwright handshake fails to obtain a valid
+    session, since no fund can be scraped without one.
+    """
+    print(f"[SYSTEM] Starting scrape run for: {', '.join(fund_list)}")
 
     end_date_obj = datetime.now()
-    start_date_obj = end_date_obj - timedelta(days=30)
+    start_date_obj = end_date_obj - timedelta(days=days_back)
     bit_tarih = end_date_obj.strftime("%Y%m%d")
     bas_tarih = start_date_obj.strftime("%Y%m%d")
 
-    print(f"[SYSTEM] Fetching last 30 days of data: {bas_tarih} -> {bit_tarih}")
+    print(f"[SYSTEM] Fetching last {days_back} days of data: {bas_tarih} -> {bit_tarih}")
 
     database = load_database()
 
     auth_header, cookie_header = acquire_session_credentials(bas_tarih, bit_tarih, recon_mode=False)
     if not auth_header:
-        print("[CRITICAL] Could not obtain a valid session. Aborting run.")
-        raise SystemExit(1)
+        raise RuntimeError("Could not obtain a valid TEFAS session (Playwright handshake failed).")
 
     session = build_authenticated_session(auth_header, cookie_header)
 
-    for fund_code in target_funds:
+    results = {}
+
+    for raw_fund_code in fund_list:
+        fund_code = raw_fund_code.strip().upper()
         print(f"\n[{fund_code}] Requesting general info and portfolio distribution...")
 
         try:
@@ -601,7 +673,9 @@ if __name__ == "__main__":
                 )
 
             if not general_records:
-                print(f"[WARNING] [{fund_code}] No general info retrieved. Skipping fund.")
+                message = "No general info retrieved (invalid fund code, or no data for this period)."
+                print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
+                results[fund_code] = {"status": "error", "message": message}
                 continue
 
             general_map = build_general_info_map(general_records)
@@ -609,7 +683,9 @@ if __name__ == "__main__":
             merged_records = merge_fund_data(general_map, distribution_map)
 
             if not merged_records:
-                print(f"[WARNING] [{fund_code}] Merge produced no usable records. Skipping fund.")
+                message = "Merge produced no usable records."
+                print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
+                results[fund_code] = {"status": "error", "message": message}
                 continue
 
             if distribution_records:
@@ -634,16 +710,31 @@ if __name__ == "__main__":
                 else:
                     updated_count += 1
 
+            # Marks this fund as freshly scraped regardless of whether it's
+            # shown on the UI or only tracked in the background, so the
+            # 15-day background-tracking cadence (see main.py's lifespan
+            # startup hook) is measured from the most recent successful run.
+            database[fund_code]["_metadata"]["last_scraped_date"] = datetime.now().strftime("%Y-%m-%d")
             save_database(database)
             print(
                 f"[SUCCESS] [{fund_code}] {inserted_count} inserted, {updated_count} updated. "
                 f"Saved to {DATABASE_FILE}."
             )
+            results[fund_code] = {"status": "success", "inserted": inserted_count, "updated": updated_count}
 
         except Exception as exc:
             print(f"[CRITICAL] [{fund_code}] Unhandled exception: {exc}")
+            results[fund_code] = {"status": "error", "message": str(exc)}
 
-        if fund_code != target_funds[-1]:
+        if raw_fund_code != fund_list[-1]:
             time.sleep(random.uniform(1.5, 3.5))
 
     print("\n[SYSTEM] All funds processed. Database is up to date.")
+    return results
+
+
+# --- Main ---------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("[SYSTEM] Initializing TEFAS API Data Scraper (hybrid mode)...")
+    scrape_and_update(["TLY", "PHE", "YAS"])
