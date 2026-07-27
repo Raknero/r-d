@@ -1,4 +1,4 @@
-# TEFAS Fund Tracker (Fon Terminali) v5.0
+# TEFAS Fund Tracker (Fon Terminali) v5.1
 
 A self-updating, full-stack financial dashboard and data pipeline for tracking Turkish mutual fund asset distributions via the TEFAS (Turkish Electronic Fund Trading Platform) API.
 
@@ -11,6 +11,9 @@ Earlier iterations of this pipeline relied on traditional HTML DOM parsing. Whil
 
 **v4.0 vs. v5.0 Architecture:**
 v4.0 was still a static dashboard: a human had to run `data_scraper.py` on a schedule, hardcode which fund codes to track, and manually edit the frontend to add a new one. v5.0 removes the human from that loop. `main.py` wraps the same scraping engine in a FastAPI application whose `lifespan` hook re-warms the database on every startup, a set of REST endpoints let the dashboard add, hide, or permanently delete funds at runtime, and a soft-delete metadata layer keeps a fund's history alive in the background even after it's removed from the UI, so re-adding it later never starts from a blank slate.
+
+**v5.0 vs. v5.1 Architecture:**
+v5.0 paid the full cost of a Playwright handshake on *every single* `scrape_and_update()` call — once per API request, once per fund in the startup scan, every time. v5.1 introduces an in-memory token cache: the Bearer token and cookies captured by Playwright are reused across calls for as long as TEFAS keeps accepting them, so adding a fund from the UI or running the 15-day background scan no longer launches a fresh browser unless it truly has to. A smart-retry layer backstops this cache — if TEFAS ever responds with `401`/`403` mid-run, the stale token is invalidated, a new one is acquired transparently, and the failed request is retried once, all without interrupting the scrape.
 
 TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), which is highly valuable for portfolio tracking. However, it is not exposed through a stable public API. The core engineering challenges overcome in this architecture include:
 
@@ -44,6 +47,12 @@ TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), wh
 
 **The Solution:** Every fund entry carries a `_metadata` object (`show_on_ui`, `background_tracking`, `last_scraped_date`) alongside its `records`. Removing a fund from the UI is a soft delete: its tab disappears, but if the user opts to keep tracking it, the `lifespan` startup hook quietly re-scrapes it once every 15 days so its history stays current without wasting a scrape on every single restart. A separate, explicit "Management Panel" and hard-delete endpoint exist for genuinely permanent removal.
 
+### 6. Repeated Playwright Handshakes on Every Scrape
+
+**The Problem:** `scrape_and_update()` is called far more often than once — every `POST /api/add-fund` request and every fund in the 15-day background scan each triggered their own independent Playwright handshake, even though the previously captured token was often still perfectly valid. This wasted seconds per call and increased the surface area for WAF detection.
+
+**The Solution:** Implemented a **token caching and smart retry** layer. A module-level cache holds the last captured `Authorization` header and cookie string; `get_session_credentials()` returns this cache directly whenever it's populated, skipping Playwright entirely. If TEFAS ever rejects the cached token with a `401`/`403` (e.g. it expired between calls), `fetch_endpoint_data()` clears the cache, re-triggers the Playwright handshake for a fresh token, rebuilds the `requests.Session`, and retries the failed request exactly once — transparently, with no change to `scrape_and_update()`'s public signature.
+
 ## Key Features
 
 **Backend (`main.py` + `data_scraper.py`)**
@@ -51,6 +60,7 @@ TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), wh
 - **Self-updating lifespan:** on every boot, automatically re-scrapes every fund currently shown on the UI, plus any hidden/background-tracked fund whose last scrape is 15+ days old, before the app starts accepting traffic.
 - **Fund lifecycle endpoints:** `POST /api/add-fund`, `POST /api/remove-fund` (soft delete, with optional continued background tracking), and `DELETE /api/hard-delete-fund` (permanent removal).
 - **Modular scraping engine:** `scrape_and_update(fund_list)` is the single entry point shared by the CLI, the lifespan hook, and every API endpoint — the Playwright/WAF-bypass logic itself never changes based on who's calling it.
+- **Token caching & smart retry:** the Playwright-captured session (Bearer token + cookies) is cached in memory and reused across calls; a `401`/`403` from TEFAS automatically invalidates the cache, re-authenticates, and retries the failed request once — no manual restarts required.
 - **Historical Merging:** Upserts into `fund_database.json`, grouping by fund code. Existing dates are overwritten (auto-correcting TEFAS revisions), and new dates are inserted chronologically.
 - **Fault Tolerance:** Per-fund error handling ensures one fund's failure doesn't abort the entire run.
 
@@ -154,7 +164,8 @@ Each run merges the latest data into `fund_database.json`, grouped by fund code.
 ## Troubleshooting & Notes
 
 - **Handshake Errors:** If you see `[ERROR] [HANDSHAKE] Failed to capture Authorization token`, TEFAS may have updated its flow. Check `acquire_session_credentials()` in `data_scraper.py`.
-- **401/403 Status:** If the captured token expires mid-run, simply re-run the script (or restart the server) for a fresh token.
-- **Frequent restarts during development:** because the `lifespan` hook re-scrapes on every boot, restarting the server repeatedly (e.g. with `--reload`) will trigger a fresh WAF handshake each time. This is expected in production but can feel slow while iterating locally.
+- **401/403 Status:** Handled automatically. `fetch_endpoint_data()` clears the cached token, re-runs the Playwright handshake, and retries the failed request once. Watch for `[CACHE] Cached TEFAS session token invalidated.` in the logs to confirm this happened; if the retry also fails, the fund is skipped for that run and the underlying error is reported.
+- **`[CACHE] Reusing cached TEFAS session token...`:** this is expected and desirable — it means `scrape_and_update()` reused an already-valid session instead of launching a new browser. The cache lives only for the lifetime of the running process, so it resets on every server restart.
+- **Frequent restarts during development:** because the `lifespan` hook re-scrapes on every boot and the token cache doesn't persist across process restarts, restarting the server repeatedly (e.g. with `--reload`) will trigger a fresh WAF handshake each time. This is expected in production but can feel slow while iterating locally.
 - **Tuning the background-tracking interval:** the 15-day cadence is controlled by `BACKGROUND_TRACKING_INTERVAL_DAYS` in `main.py`.
 - **Data Privacy:** `fund_database.json` is treated as local environment data and is ignored via `.gitignore`.

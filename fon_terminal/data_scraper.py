@@ -40,6 +40,7 @@ TEFAS_DISTRIBUTION_MAP = {
     "osks": "Özel Sektör Kira Sertifikaları",
     "tr": "Ters-Repo",
     "r": "Repo",
+    "d": "Diğer",
     "vmtl": "Mevduat (TL)",
     "gykb": "Gayrimenkul Yatırım Fonları Katılma Payları",
     "yyf": "Yatırım Fonları Katılma Payları",
@@ -317,6 +318,54 @@ def acquire_session_credentials(
     return captured["authorization"], captured["cookie"]
 
 
+# --- Token cache: avoids a Playwright handshake on every scrape run ---------
+#
+# `_cached_headers` holds the captured `Authorization: Bearer ...` value and
+# `_cached_cookies` holds the raw Cookie header string; together they
+# represent one authenticated TEFAS session. As long as TEFAS keeps
+# accepting them, `scrape_and_update()` can be called repeatedly (e.g. once
+# per `/api/add-fund` request, or once per fund in the lifespan startup
+# scan) without paying the cost of a fresh Playwright browser launch every
+# single time. The cache lives for the lifetime of the Python process.
+_cached_headers = None
+_cached_cookies = None
+
+
+def get_session_credentials(bas_tarih, bit_tarih, force_refresh=False):
+    """Returns (auth_header, cookie_header), reusing the in-memory cache
+    whenever a valid one is available so Playwright is only launched when
+    there's truly no usable session yet (first run, or after the cache was
+    invalidated by a 401/403 -- see `invalidate_cached_credentials`).
+
+    `force_refresh=True` skips the cache unconditionally, e.g. right after
+    invalidating it to obtain a brand-new token.
+    """
+    global _cached_headers, _cached_cookies
+
+    if not force_refresh and _cached_headers and _cached_cookies:
+        print("[CACHE] Reusing cached TEFAS session token (skipping Playwright handshake).")
+        return _cached_headers, _cached_cookies
+
+    auth_header, cookie_header = acquire_session_credentials(bas_tarih, bit_tarih, recon_mode=False)
+    if auth_header:
+        _cached_headers = auth_header
+        _cached_cookies = cookie_header
+
+    return auth_header, cookie_header
+
+
+def invalidate_cached_credentials():
+    """Clears the in-memory token/cookie cache, forcing the next
+    `get_session_credentials()` call to perform a fresh Playwright
+    handshake. Called when TEFAS responds with 401/403, signalling that
+    the cached token has expired or been rejected.
+    """
+    global _cached_headers, _cached_cookies
+    _cached_headers = None
+    _cached_cookies = None
+    print("[CACHE] Cached TEFAS session token invalidated.")
+
+
 def build_authenticated_session(auth_header, cookie_header):
     """Builds a requests.Session pre-loaded with the Bearer token AND the
     full cookie string captured from the Playwright browser context. TEFAS's
@@ -403,39 +452,64 @@ def build_distribution_payload(fund_code, bas_tarih, bit_tarih):
     }
 
 
-def fetch_endpoint_data(session, url, fund_code, payload):
+def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
     """Issues a POST request to a TEFAS API endpoint with the given payload
-    and returns the list of records for the given fund, or an empty list on
-    any failure.
+    and returns a (records, session) tuple for the given fund.
+
+    Smart retry: if TEFAS responds with HTTP 401/403, the cached session
+    token has expired or been rejected. In that case the in-memory cache is
+    invalidated, a fresh Playwright handshake is triggered to obtain a new
+    token/cookie pair, a new authenticated `requests.Session` is built from
+    it, and the request is retried exactly once with the refreshed session.
+    The (possibly refreshed) session is always returned so the caller can
+    keep reusing it for subsequent requests in the same run instead of
+    re-authenticating again.
     """
-    try:
-        response = session.post(url, json=payload, timeout=20)
-    except requests.exceptions.RequestException as exc:
-        print(f"[ERROR] [{fund_code}] Network error calling {url}: {exc}")
-        return []
+    for attempt in range(2):
+        try:
+            response = session.post(url, json=payload, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            print(f"[ERROR] [{fund_code}] Network error calling {url}: {exc}")
+            return [], session
 
-    if response.status_code in (401, 403):
-        print(
-            f"[ERROR] [{fund_code}] {url} returned HTTP {response.status_code} "
-            "(session token likely expired or rejected)"
-        )
-        return []
+        if response.status_code in (401, 403):
+            if attempt == 1:
+                print(
+                    f"[ERROR] [{fund_code}] {url} still returned HTTP {response.status_code} "
+                    "after refreshing the session token; giving up for this request."
+                )
+                return [], session
 
-    if response.status_code != 200:
-        print(f"[ERROR] [{fund_code}] {url} returned HTTP {response.status_code}")
-        return []
+            print(
+                f"[WARNING] [{fund_code}] {url} returned HTTP {response.status_code} "
+                "(session token expired/rejected). Re-authenticating via Playwright and retrying..."
+            )
+            invalidate_cached_credentials()
+            auth_header, cookie_header = get_session_credentials(bas_tarih, bit_tarih, force_refresh=True)
+            if not auth_header:
+                print(f"[ERROR] [{fund_code}] Failed to refresh TEFAS session; aborting retry.")
+                return [], session
 
-    try:
-        payload_json = response.json()
-    except ValueError:
-        print(f"[ERROR] [{fund_code}] Invalid JSON response from {url}")
-        return []
+            session = build_authenticated_session(auth_header, cookie_header)
+            continue
 
-    records = extract_records(payload_json)
-    if not records:
-        print(f"[WARNING] [{fund_code}] No records found in response from {url}")
+        if response.status_code != 200:
+            print(f"[ERROR] [{fund_code}] {url} returned HTTP {response.status_code}")
+            return [], session
 
-    return filter_by_fund_code(records, fund_code)
+        try:
+            payload_json = response.json()
+        except ValueError:
+            print(f"[ERROR] [{fund_code}] Invalid JSON response from {url}")
+            return [], session
+
+        records = extract_records(payload_json)
+        if not records:
+            print(f"[WARNING] [{fund_code}] No records found in response from {url}")
+
+        return filter_by_fund_code(records, fund_code), session
+
+    return [], session
 
 
 # --- Response parsing / merging ---------------------------------------------
@@ -620,6 +694,15 @@ def scrape_and_update(fund_list, days_back=30):
     flow) for the given fund codes, merging freshly fetched data into
     `fund_database.json`.
 
+    Token caching: the Playwright handshake is only performed when there is
+    no valid cached session yet (see `get_session_credentials`), so calling
+    this function repeatedly within the same process -- e.g. once per
+    `/api/add-fund` request, or once per fund during the FastAPI lifespan
+    startup scan -- reuses the same token/cookie pair instead of launching a
+    new browser every time. If TEFAS ever rejects that cached token with a
+    401/403 mid-run, the affected request is automatically retried once
+    after transparently re-authenticating (see `fetch_endpoint_data`).
+
     This is the single reusable entry point shared by the CLI (`python
     data_scraper.py`) and by the FastAPI `/api/add-fund` endpoint in
     `main.py`, which calls it on demand for one newly requested fund code.
@@ -644,7 +727,7 @@ def scrape_and_update(fund_list, days_back=30):
 
     database = load_database()
 
-    auth_header, cookie_header = acquire_session_credentials(bas_tarih, bit_tarih, recon_mode=False)
+    auth_header, cookie_header = get_session_credentials(bas_tarih, bit_tarih)
     if not auth_header:
         raise RuntimeError("Could not obtain a valid TEFAS session (Playwright handshake failed).")
 
@@ -660,8 +743,12 @@ def scrape_and_update(fund_list, days_back=30):
             general_payload = build_general_info_payload(fund_code, bas_tarih, bit_tarih)
             distribution_payload = build_distribution_payload(fund_code, bas_tarih, bit_tarih)
 
-            general_records = fetch_endpoint_data(session, GENERAL_INFO_URL, fund_code, general_payload)
-            distribution_records = fetch_endpoint_data(session, DISTRIBUTION_URL, fund_code, distribution_payload)
+            general_records, session = fetch_endpoint_data(
+                session, GENERAL_INFO_URL, fund_code, general_payload, bas_tarih, bit_tarih
+            )
+            distribution_records, session = fetch_endpoint_data(
+                session, DISTRIBUTION_URL, fund_code, distribution_payload, bas_tarih, bit_tarih
+            )
 
             if not distribution_records:
                 # Qualified/restricted funds (e.g. YAS) legitimately don't
