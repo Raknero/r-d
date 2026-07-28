@@ -294,7 +294,110 @@ def _format_turkish_number(value: float) -> str:
     return us_formatted.replace(",", "\u0001").replace(".", ",").replace("\u0001", ".")
 
 
-def export_to_html(parsed_data: Dict[str, Dict[str, float]], output_filename: str = "parser_kontrol_raporu.html") -> str:
+def _holdings_table_html(holdings: Dict[str, float], code_header: str = "Hisse/Varlık Kodu") -> str:
+    """Shared renderer for a simple {kod: lot} table with a TOPLAM footer
+    row, used both by the per-period cards above and by the "Güncel
+    Portföy Son Durumu" delta section below."""
+    if not holdings:
+        return '<p class="empty-notice">Veri bulunamadı.</p>'
+    rows = "".join(
+        f"""
+              <tr>
+                <td>{html.escape(str(ticker))}</td>
+                <td class="num">{html.escape(_format_turkish_number(holdings[ticker]))}</td>
+              </tr>"""
+        for ticker in sorted(holdings)
+    )
+    total = sum(holdings.values())
+    return f"""
+          <table>
+            <thead><tr><th>{html.escape(code_header)}</th><th class="num">Nominal Değer (Lot)</th></tr></thead>
+            <tbody>{rows}
+            </tbody>
+            <tfoot><tr><td>TOPLAM</td><td class="num">{html.escape(_format_turkish_number(total))}</td></tr></tfoot>
+          </table>"""
+
+
+def _render_delta_sections(delta_report: dict) -> str:
+    """Renders the three `kap_delta_engine.KAPDeltaEngine.apply_delta`
+    sections (`export_to_html`'s `delta_report` argument) as extra
+    full-width `.period-card`-styled sections: Kesinlesen Deltalar,
+    Cozulemeyen/Coklu Fon Bildirimleri, and Guncel Portfoy Son Durumu.
+    Never raises: missing/empty lists are rendered as an explicit
+    "veri bulunamadi" notice rather than a broken table.
+    """
+    fon_kodu = delta_report.get("fon_kodu") or ""
+    baseline_period = delta_report.get("baseline_period") or "?"
+    resolved = delta_report.get("resolved") or []
+    unresolved = delta_report.get("unresolved") or []
+    updated_data = delta_report.get("updated_data") or {}
+
+    if resolved:
+        resolved_rows = "".join(
+            f"""
+              <tr>
+                <td>{html.escape(str(item.get('date', '')))}</td>
+                <td>{html.escape(str(item.get('ticker', '')))}</td>
+                <td class="num">{html.escape(_format_turkish_number(item.get('lot', 0.0)))}</td>
+                <td class="{'dir-alim' if item.get('direction') == 'ALIM' else 'dir-satim' if item.get('direction') == 'SATIM' else ''}">{html.escape(str(item.get('direction', '')))}</td>
+              </tr>"""
+            for item in sorted(resolved, key=lambda item: item.get("date", ""))
+        )
+        resolved_html = f"""
+          <table>
+            <thead><tr><th>Tarih</th><th>Hisse/Pay Kodu</th><th class="num">Lot Miktarı</th><th>İşlem Yönü</th></tr></thead>
+            <tbody>{resolved_rows}
+            </tbody>
+          </table>"""
+    else:
+        resolved_html = '<p class="empty-notice">Bu aralıkta kesinleşmiş (tek-fonlu) bir işlem bulunamadı.</p>'
+
+    if unresolved:
+        unresolved_rows = "".join(
+            f"""
+              <tr>
+                <td>{html.escape(str(item.get('date', '')))}</td>
+                <td>{html.escape(', '.join(item.get('related_funds') or []))}</td>
+                <td>{html.escape(', '.join(item.get('companies') or []) or 'BİLİNMEYEN')}</td>
+                <td class="num">{html.escape(_format_turkish_number(item['net_lot'])) if item.get('net_lot') is not None else '-'}</td>
+              </tr>"""
+            for item in sorted(unresolved, key=lambda item: item.get("date", ""))
+        )
+        unresolved_html = f"""
+          <table>
+            <thead><tr><th>Tarih</th><th>İlgili Fonlar Listesi</th><th>Hisse/Pay Kodu</th><th class="num">Toplam Lot Miktarı (Net)</th></tr></thead>
+            <tbody>{unresolved_rows}
+            </tbody>
+          </table>
+          <p class="warn-notice">Bu {len(unresolved)} bildirim birden fazla fonu aynı anda kapsadığı için '{html.escape(fon_kodu)}'a özel kırılım KAP verisinde mevcut değil; bu yüzden Güncel Portföy Son Durumu'na dahil edilmemiştir.</p>"""
+    else:
+        unresolved_html = '<p class="empty-notice">Bu aralıkta çok-fonlu/çözülemeyen bir bildirim bulunamadı.</p>'
+
+    return f"""
+  <div class="delta-sections">
+    <section class="period-card">
+      <h2>Kesinleşen Deltalar <span class="badge ok">{len(resolved)} işlem</span></h2>
+      <p class="section-desc">{html.escape(fon_kodu)} baseline dönemi {html.escape(baseline_period)} sonrası, sadece {html.escape(fon_kodu)}'yı kapsayan ve başarıyla uygulanmış işlemler.</p>
+      {resolved_html}
+    </section>
+    <section class="period-card">
+      <h2>Çözülemeyen / Çoklu Fon Bildirimleri <span class="badge warn">{len(unresolved)} bildirim</span></h2>
+      <p class="section-desc">KAP'tan dönen ama birden fazla fonu kapsadığı için {html.escape(fon_kodu)}'ya özel ayrıştırılamayan işlemler.</p>
+      {unresolved_html}
+    </section>
+    <section class="period-card">
+      <h2>Güncel Portföy Son Durumu <span class="badge">{len(updated_data)} kod</span></h2>
+      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü + Kesinleşen Deltalar (Çözülemeyen bildirimler hariç).</p>
+      {_holdings_table_html(updated_data, code_header="Hisse/Pay Kodu")}
+    </section>
+  </div>"""
+
+
+def export_to_html(
+    parsed_data: Dict[str, Dict[str, float]],
+    output_filename: str = "parser_kontrol_raporu.html",
+    delta_report: Optional[dict] = None,
+) -> str:
     """Renders the nested dict returned by `KAPPdfParser.parse_directory()`
     (`{"2026_01": {"ALKLC": 731256.0, ...}, "2026_02": {...}}`) as a single,
     standalone HTML file for manual visual double-checking of the parsed
@@ -302,9 +405,34 @@ def export_to_html(parsed_data: Dict[str, Dict[str, float]], output_filename: st
     "Nominal Deger (Lot)" column, Turkish-formatted numbers, alternating
     row colors, and a hover highlight.
 
+    Optional `delta_report` extends the same file with the intra-month
+    "Pay Alim Satim Bildirimi" results produced by
+    `kap_delta_engine.KAPDeltaEngine.apply_delta` (see that module for how
+    they're computed), as three extra sections appended after the
+    per-period grid above -- this module has no import dependency on
+    `kap_delta_engine.py` itself, so the caller passes plain dicts/lists,
+    shaped as:
+
+        {
+            "fon_kodu": "TLY",
+            "baseline_period": "2026_03",             # which parsed_data key was used as the delta baseline
+            "resolved": [                               # single-fund, applied deltas
+                {"date": "23/07/2026", "ticker": "BIGEN", "lot": 42469924.0, "direction": "ALIM"},
+                ...
+            ],
+            "unresolved": [                             # multi-fund, NOT applied -- see kap_delta_engine's docstring
+                {"date": "02/07/2026", "related_funds": ["T3B", "TLY"], "companies": ["PEKGY"], "net_lot": 38176445.0},
+                ...
+            ],
+            "updated_data": {"ALKLC": 731256.0, "BIGEN": 42469924.0, ...},  # baseline + resolved
+        }
+
+    Pass `delta_report=None` (the default) to render exactly the original
+    per-period report with no extra sections -- fully backward compatible.
+
     Writes the file to `output_filename` (relative paths are created in the
     current working directory) and also returns the generated HTML string.
-    Never raises: any period whose holdings dict is empty/missing is
+    Never raises: any period (or delta list) that's empty/missing is
     rendered as an explicit "veri bulunamadi" notice rather than a broken
     table, and a bad `output_filename` results in a logged error rather
     than an unhandled crash.
@@ -361,6 +489,8 @@ def export_to_html(parsed_data: Dict[str, Dict[str, float]], output_filename: st
           </table>
         </section>"""
         )
+
+    delta_sections_html = _render_delta_sections(delta_report) if delta_report else ""
 
     html_document = f"""<!DOCTYPE html>
 <html lang="tr">
@@ -460,6 +590,35 @@ def export_to_html(parsed_data: Dict[str, Dict[str, float]], output_filename: st
     font-variant-numeric: tabular-nums;
     font-family: "Consolas", "Courier New", monospace;
   }}
+  .delta-sections {{
+    max-width: 1200px;
+    margin: 36px auto 0;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }}
+  .delta-sections .period-card {{
+    flex: none;
+    min-width: 0;
+  }}
+  .badge.warn {{ color: #92400e; background: #fef3c7; }}
+  .badge.ok {{ color: #065f46; background: #d1fae5; }}
+  .section-desc {{
+    margin: -6px 0 14px;
+    color: #6b7280;
+    font-size: 12.5px;
+  }}
+  .warn-notice {{
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12.5px;
+    margin: 14px 0 0;
+  }}
+  .dir-alim {{ color: #065f46; font-weight: 600; }}
+  .dir-satim {{ color: #991b1b; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -469,6 +628,7 @@ def export_to_html(parsed_data: Dict[str, Dict[str, float]], output_filename: st
   </header>
   <div class="grid">{''.join(sections)}
   </div>
+  {delta_sections_html}
 </body>
 </html>
 """

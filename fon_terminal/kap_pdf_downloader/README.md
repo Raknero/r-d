@@ -6,10 +6,13 @@ attachments from KAP (Kamuyu Aydinlatma Platformu / Public Disclosure
 Platform). Currently ships with the `TLY` (Tera Portfoy Birinci Serbest
 Fon) fund pre-registered.
 
-This directory is intentionally decoupled from the rest of the repository
--- it has its own `requirements.txt` and does not import anything from
-`fon_terminal/`. It is meant to be imported into another project later as
-a single drop-in module (`kap_downloader.py`).
+This directory lives inside `fon_terminal/` but is intentionally
+decoupled from the rest of the application -- it has its own
+`requirements.txt` and does not import anything from `fon_terminal/`'s
+own modules (`data_scraper.py`, `main.py`, etc.). The three modules here
+(`kap_downloader.py`, `kap_pdf_parser.py`, `kap_delta_engine.py`) only
+depend on each other and third-party packages, so the whole folder can
+still be lifted into another project as a self-contained unit.
 
 ## How it works
 
@@ -151,3 +154,115 @@ footer row per table so the sum can be eyeballed against the PDF's own
 Running `python kap_pdf_parser.py` now does both steps: prints the parsed
 holdings to the console, then writes `parser_kontrol_raporu.html` into the
 current directory for visual verification.
+
+---
+
+## `kap_delta_engine.py` -- bridging the gap between monthly reports
+
+`KAPPdfParser` gives an exact holdings snapshot, but only once a month
+(whenever KAP publishes the next "Portfoy Dagilim Raporu"). `KAPDeltaEngine`
+keeps that snapshot current in between reports by layering KAP's
+intra-month buy/sell disclosures on top of it.
+
+### Architecture
+
+`KAPDeltaEngine` reuses `KAPPdfDownloader`'s detail-page endpoint
+(`/tr/Bildirim/{disclosureIndex}`) and its Turkish-number-parsing
+convention, but its disclosure *list* stage queries a different KAP
+endpoint entirely -- see "Endpoint correction" below for why.
+
+1. **Disclosure list** -- `POST /tr/api/disclosure/members/byCriteria`,
+   scoped to the fund's portfolio management company via
+   `MANAGER_MKK_MEMBER_OID`, filtered client-side to `subject == "Pay
+   Alim Satim Bildirimi"` entries whose `relatedStocks` field mentions
+   the target fund code, published inside the requested date window.
+2. **Detail page parsing** -- fetches the same `/tr/Bildirim/{disclosureIndex}`
+   page `KAPPdfDownloader` reads for the monthly report's PDF link, but
+   parses its inline `tbl_oda-10400_Shares-Transaction-Notification`
+   table with BeautifulSoup instead: a GWT-rendered taxonomy table where
+   every column is duplicated Turkish-then-English with no separator
+   between the halves (the split point is located by finding the first
+   `"Transaction Date"` cell), and rows are matched by their Turkish
+   label text (`"İlgili Şirketler"`, `"İlgili Fonlar"`, `"İşlem
+   Tarihi"`) rather than a fixed row index, since optional flag rows
+   shift the layout between disclosures.
+
+### Usage
+
+```python
+from kap_pdf_parser import KAPPdfParser
+from kap_delta_engine import KAPDeltaEngine
+
+baseline = KAPPdfParser().parse_file("tly_pdfs/TLY_2026_06.pdf")
+
+with KAPDeltaEngine(fon_kodu="TLY") as engine:
+    updated, unresolved = engine.apply_delta(baseline, start_date="2026-06-01", end_date="2026-07-28")
+
+# `updated` only reflects disclosures that named TLY exclusively.
+# `unresolved` is every multi-fund disclosure, fully parsed but not
+# merged -- see "Data limitation" below before assuming `updated` is complete.
+```
+
+Or run it directly (uses a hardcoded `{"SVGYO": 10000.0}` baseline and
+prints an "Onceki -> Delta -> Sonraki" comparison plus the full list of
+unresolved multi-fund disclosures for the last 30 days):
+
+```bash
+python kap_delta_engine.py
+```
+
+### Endpoint correction (2026-07-28)
+
+The first version of `_fetch_delta_disclosures` queried the same
+`FILTERYFBF` endpoint `KAPPdfDownloader` uses for the monthly report,
+which only ever returns `"Portfoy Dagilim Raporu"` entries for `TLY` --
+it returned zero buy/sell notices. **That was a wrong endpoint choice,
+not evidence that the fund doesn't publish them.** `FILTERYFBF` is
+scoped to the "Yatirim Fonu Bildirimleri" (fund report) category only.
+
+`"Pay Alim Satim Bildirimi"` disclosures are filed under a different KAP
+category (`disclosureClass: "ODA"`) by the fund's *portfolio management
+company* ("Tera Portfoy Yonetimi A.S." for TLY), via KAP's general
+member-disclosure query endpoint:
+`POST /tr/api/disclosure/members/byCriteria` with
+`mkkMemberOidList: [manager_mkk_member_oid]` and an explicit
+`fromDate`/`toDate` range. Verified live: **113 such disclosures exist
+for TLY's manager over the last 12 months.** The manager's `mkkMemberOid`
+is not the same OID pair `KAPPdfDownloader` uses (`company_oid`/
+`member_oid`) -- it's a separate identifier, registered per-fund in
+`KAPDeltaEngine.MANAGER_MKK_MEMBER_OID`.
+
+Each disclosure's detail page (`/tr/Bildirim/{disclosureIndex}`) carries
+its data inline as a `tbl_oda-10400_Shares-Transaction-Notification`
+taxonomy table (GWT-rendered, every field duplicated Turkish-then-English
+with no separator, and un-nested field labels rather than a simple flat
+grid) -- see `_parse_html_table` for how it's located and parsed.
+
+### Data limitation (verified, not assumed): no per-fund breakdown
+
+Most disclosures fetched for TLY name **multiple funds at once** in
+their "İlgili Fonlar" (Related Funds) field -- e.g. one notice's related
+funds are `[T3B, TLY, TMV, TGI]` -- because the disclosure is filed by
+the *management company* for its combined position across every fund it
+manages that holds the traded security. **For those, KAP's data contains
+a single aggregate buy/sell/net nominal TL figure for the combined
+position; it does not break the trade down per individual fund
+anywhere.** Verified live (2026-07-28) on a 30-day/24-disclosure sample
+for TLY: 23 of 24 named multiple funds; only 1 (disclosureIndex
+`1636905`, a "BIGEN, TLY"-only notice) named TLY exclusively. A full
+12-month re-check is still pending -- KAP's WAF rate-limited this
+project's IP (`429 Request Limit Exceeded`) partway through a broader
+verification pass, so that count is not yet confirmed and is not claimed
+here.
+
+`apply_delta()` handles this honestly rather than guessing: it only
+auto-merges a disclosure into the baseline when it names the target fund
+*exclusively* (an unambiguous case). Every multi-fund disclosure is still
+fully parsed -- transaction date, traded company/companies, the complete
+related-funds list, and all five nominal TL figures -- and returned as-is
+via the `unresolved` list in `apply_delta`'s return value, but is
+deliberately kept out of the merged baseline. Attributing a manager-level
+aggregate to one fund would require an allocation rule KAP's data doesn't
+provide (e.g. an AUM-proportional split), and fabricating one would
+silently corrupt the holdings numbers -- so this is left as an explicit,
+visible gap for a human to resolve rather than a silent guess.
