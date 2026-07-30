@@ -62,6 +62,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from kap_downloader import KAPPdfDownloader
+from kap_pdf_parser import KAPPdfParser
 
 
 @dataclass
@@ -140,6 +141,13 @@ class KAPDeltaEngine:
        fund exclusively; every disclosure naming multiple funds is parsed
        and returned in full but kept out of the merged baseline (see the
        "UNRESOLVED DATA LIMITATION" note in the module docstring).
+    4. `discover_related_funds()` -- the "Kesif" (Discovery) stage --
+       scans (3)'s multi-fund `unresolved` list and extracts every unique
+       fund code these disclosures name alongside the target fund, into
+       a single deduplicated array (e.g. `["TLY", "TMV", "T3B", "DOH",
+       "THF"]`). This is how the module dynamically discovers which other
+       funds share the target fund's portfolio manager, without hardcoding
+       them, for future per-fund KAP PDF downloads / TEFAS data fetches.
     """
 
     BASE_URL = KAPPdfDownloader.BASE_URL
@@ -179,6 +187,7 @@ class KAPDeltaEngine:
         self.request_delay = request_delay
         self.timeout = timeout
         self.session = self._build_session()
+        self.discovered_related_funds: List[str] = []  # populated by discover_related_funds()
 
     # --- Context manager support --------------------------------------------
 
@@ -443,6 +452,69 @@ class KAPDeltaEngine:
         cleaned = value.strip().replace(".", "").replace(",", ".")
         return float(cleaned)
 
+    # --- Discovery phase: find funds that co-file with the target fund --------
+
+    def discover_related_funds(self, unresolved: List[ParsedTransaction]) -> List[str]:
+        """"Kesif" (Discovery) asamasi: `apply_delta()`'nin dondurdugu
+        `unresolved` (cok-fonlu, cozulemeyen) islemlerin "Ilgili Fonlar"
+        listelerini tarayarak, KAP'ta bu fonun (self.fon_kodu) portfoy
+        yonetim sirketiyle ORTAK bildirime konu olan butun fon kodlarini
+        tek, benzersiz (duplicate'siz) bir diziye toplar.
+
+        Her `ParsedTransaction.related_funds` zaten `_extract_bracketed_list`
+        tarafindan ayristirilmis temiz bir `List[str]`'dir, ama bu metot
+        `_clean_fund_codes` uzerinden GECER YINE de savunmaci davranir:
+        ham "DOH, T3B, TLY, TMV, THF" veya "[DOH, T3B, TLY]" formatinda
+        serbest metin de girdi olarak kabul edilir ve parantez/tirnak/
+        bosluk gibi kalinti karakterlerden arindirilir -- boylece ileride
+        bu metodun farkli bir veri kaynagindan (ornegin ham HTML/log metni)
+        beslenmesi gerekirse davranis degismez.
+
+        Hedef fon (`self.fon_kodu`) diziye her zaman ilk eleman olarak
+        eklenir (referans noktasi); geri kalan kodlar ilk gorulme sirasina
+        gore, tekrarsiz sekilde eklenir. Sonuc hem return edilir hem de
+        `self.discovered_related_funds` uzerinde saklanir, boylece bir
+        sonraki adimlar (gelecekteki KAP PDF indirmeleri / bu fonlar icin
+        TEFAS veri cekme islemleri) bu diziyi dogrudan tuketebilir.
+        """
+        discovered: List[str] = [self.fon_kodu]
+        seen = {self.fon_kodu}
+
+        for txn in unresolved:
+            for code in self._clean_fund_codes(txn.related_funds):
+                if code not in seen:
+                    seen.add(code)
+                    discovered.append(code)
+
+        self.discovered_related_funds = discovered
+        print(f"[KEŞİF] [{self.fon_kodu}] Keşif Aşaması Tamamlandı. Hedef Fonlar Dizisi: {discovered}")
+        return discovered
+
+    @staticmethod
+    def _clean_fund_codes(value) -> List[str]:
+        """Yuksek hassasiyetli fon kodu ayristirici: girdi olarak hem
+        zaten ayristirilmis bir `List[str]` hem de "DOH, T3B, TLY" /
+        "[DOH, T3B, TLY]" formatinda ham, sinirlandirilmis (delimited)
+        metin kabul eder. Her iki durumda da her token'in bastaki/sondaki
+        bosluklari, koseli/normal parantezleri ve tirnak isaretlerini
+        temizler, buyuk harfe cevirir, ve sonucta gecerli bir fon kodu
+        gorunumune uymayan (bos, tek karakterlik, noktalama iceren vb.)
+        kalinti degerleri sessizce eler -- boylece cikan dizide asla
+        trailing space veya bozuk karakter kalmaz."""
+        if not value:
+            return []
+        if isinstance(value, str):
+            tokens = re.split(r"[,\s]+", value.strip("[]() \t\n\r"))
+        else:
+            tokens = list(value)
+
+        cleaned: List[str] = []
+        for token in tokens:
+            code = str(token).strip().strip("[]()'\"").upper()
+            if re.fullmatch(r"[A-ZÇĞİÖŞÜ0-9]{2,10}", code):
+                cleaned.append(code)
+        return cleaned
+
     # --- Public entry point ---------------------------------------------------
 
     def apply_delta(
@@ -519,10 +591,108 @@ class KAPDeltaEngine:
 
 
 
+# --- Step 2: collect a same-period baseline for every discovered fund -------
+
+
+def collect_global_baseline(
+    related_funds: List[str],
+    baseline_period: Tuple[int, int],
+    days_back: int = 365,
+) -> Dict[str, Dict[str, float]]:
+    """Orchestrates `kap_downloader.KAPPdfDownloader` + `kap_pdf_parser.
+    KAPPdfParser` across every fund code in `related_funds` (typically
+    `KAPDeltaEngine.discover_related_funds()`'s output) to build a single
+    "Golge Portfoy" global baseline snapshot, all aligned to the SAME
+    monthly "Portfoy Dagilim Raporu" period:
+
+        global_baseline = {
+            "TLY": {"ALKLC": 731256.0, ...},
+            "DOH": {"ALKLC": 150000.0, ...},
+            ...
+        }
+
+    `baseline_period` is an inclusive `(year, donem)` pair (e.g. `(2026, 3)`
+    for March 2026) -- typically the target fund's own latest parsed PDF
+    period -- so every fund in the result represents the same point in
+    time. Each fund's PDF(s) are downloaded into their own
+    `{fon_kodu_lower}_pdfs/` folder (e.g. `doh_pdfs/`, `t3b_pdfs/`), kept
+    separate from `tly_pdfs/` and from each other.
+
+    `days_back` defaults to 365 and should not be raised past that: KAP's
+    FILTERYFBF endpoint silently returns an empty list (HTTP 200, `[]`,
+    no error) for any `days_back` value of 366 or higher -- verified live
+    (2026-07-30) by probing 30/90/180/365/366/400, where 365 returned 13
+    TLY disclosures and 366+ returned 0. If `baseline_period` is ever
+    older than ~1 year, split the call across multiple date windows
+    instead of raising this value.
+
+    Never raises and never aborts the loop: a fund missing from
+    `KAPPdfDownloader.KNOWN_FUNDS` (no registered KAP OID -- true today
+    for every discovered fund except TLY itself), a download failure, or
+    an empty/missing parse result for the target period are all caught,
+    logged as "[UYARI]", and treated as "skip this fund, keep going" --
+    the returned dict simply omits that fund's entry rather than crashing
+    or fabricating data for it.
+    """
+    year, donem = baseline_period
+    period_key = f"{year}_{donem:02d}"
+    global_baseline: Dict[str, Dict[str, float]] = {}
+
+    print(
+        f"\n[SISTEM] Global Baseline Toplama Basladi: {len(related_funds)} fon, "
+        f"hedef donem={period_key}"
+    )
+
+    for fon_kodu in related_funds:
+        output_dir = f"{fon_kodu.lower()}_pdfs"
+
+        try:
+            with KAPPdfDownloader(fon_kodu=fon_kodu, output_dir=output_dir) as downloader:
+                download_results = downloader.download_reports(
+                    days_back=days_back,
+                    start_period=baseline_period,
+                    end_period=baseline_period,
+                )
+        except ValueError as exc:
+            # Fund not registered in KNOWN_FUNDS (no KAP company/member OID
+            # captured for it yet) -- an honest gap, not a bug; never guess
+            # the OID, just skip and move on.
+            print(f"[UYARI] [{fon_kodu}] KAP OID bilgisi tanimli degil, atlaniyor: {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001 - one bad fund must never abort the loop
+            print(f"[UYARI] [{fon_kodu}] PDF indirme sirasinda beklenmeyen hata, atlaniyor: {exc}")
+            continue
+
+        if not any(r.get("status") == "success" for r in download_results):
+            print(f"[UYARI] [{fon_kodu}] {period_key} donemine ait PDF KAP'ta bulunamadi/indirilemedi, atlaniyor.")
+            continue
+
+        try:
+            history = KAPPdfParser().parse_directory(output_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[UYARI] [{fon_kodu}] PDF parse edilirken beklenmeyen hata, atlaniyor: {exc}")
+            continue
+
+        holdings = history.get(period_key) or {}
+        if not holdings:
+            print(f"[UYARI] [{fon_kodu}] {period_key} donemi icin ayristirilmis veri bos donuyor, atlaniyor.")
+            continue
+
+        global_baseline[fon_kodu] = holdings
+        print(f"[BASARILI] [{fon_kodu}] {period_key} baseline'i toplandi ({len(holdings)} hisse kodu).")
+
+    all_tickers = {ticker for holdings in global_baseline.values() for ticker in holdings}
+    print(
+        f"\n[SISTEM] Global Baseline Toplama Tamamlandi: {len(global_baseline)}/{len(related_funds)} fon "
+        f"basariyla toplandi, {len(all_tickers)} benzersiz hisse kodu bulundu."
+    )
+    return global_baseline
+
+
 if __name__ == "__main__":
     from datetime import date
 
-    from kap_pdf_parser import KAPPdfParser, export_to_html
+    from kap_pdf_parser import export_to_html
 
     FON_KODU = "TLY"
 
@@ -576,6 +746,23 @@ if __name__ == "__main__":
         )
     if len(unresolved) > 10:
         print(f"  ... ve {len(unresolved) - 10} tane daha.")
+
+    print("\n=== Keşif (Discovery) Aşaması ===")
+    related_funds_target_array = engine.discover_related_funds(unresolved)
+
+    print("\n=== Adım 2: Global Baseline Toplama ===")
+    baseline_year, baseline_donem = (int(part) for part in latest_period.split("_"))
+    global_baseline = collect_global_baseline(
+        related_funds_target_array,
+        baseline_period=(baseline_year, baseline_donem),
+    )
+    print("\n=== Global Baseline Özeti ===")
+    for fund_code in related_funds_target_array:
+        holdings = global_baseline.get(fund_code)
+        if holdings is None:
+            print(f"  {fund_code:8s}  -> VERI YOK (atlandi)")
+        else:
+            print(f"  {fund_code:8s}  -> {len(holdings)} hisse kodu")
 
     # Reshape into the plain dict/list shapes kap_pdf_parser.export_to_html
     # expects, so that module keeps zero hard dependency on this one's

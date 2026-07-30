@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from bs4 import BeautifulSoup
 
 
 @dataclass
@@ -71,21 +72,47 @@ class KAPPdfDownloader:
 
     KAP's disclosure filter endpoint is scoped to a specific fund via two
     opaque GUIDs (a "company"/fund OID and a "member" OID) rather than the
-    human-readable fund code, so each supported fund is registered in
-    `KNOWN_FUNDS` below; add an entry there to support a new fund code.
+    human-readable fund code. Fund identity resolution (`__init__`) tries
+    two sources, in order:
+
+    1. `KNOWN_FUNDS` -- a small, hand-verified static override (kept for
+       funds worth pinning explicitly / documenting a manager's own
+       `unvan`). Checked first so it never pays a network round-trip.
+    2. `build_dynamic_fund_directory()` -- scrapes EVERY fund's `company_oid`
+       from KAP's public "Yatirim Fonlari" listing page (see that method's
+       docstring), so ANY fund code KAP tracks works out of the box, not
+       just the handful registered above.
+
+    Endpoint discovery note (2026-07-30): the FILTER_ENDPOINT's "member_oid"
+    path segment was originally assumed to be unique per fund/manager (it
+    was captured from TLY's own network traffic). Live probing proved this
+    wrong -- it is NOT fund- or manager-specific: reusing TLY's own value
+    against completely unrelated funds (Is Portfoy's IHK, plus a random
+    sample of 12 other fund codes spanning several different portfolio
+    management companies) correctly returned that OTHER fund's own
+    "Portfoy Dagilim Raporu" disclosures in every case where the fund
+    actually publishes one. So this single constant (`GENERIC_MEMBER_OID`)
+    can safely be reused for any fund's `company_oid`, which is what makes
+    dynamic, code-only fund resolution possible at all.
     """
 
     BASE_URL = "https://kap.org.tr"
     FILTER_ENDPOINT = "/tr/api/disclosure/filter/FILTERYFBF/{company_oid}/{member_oid}/{days_back}"
     DETAIL_PAGE = "/tr/Bildirim/{disclosure_index}"
     DOWNLOAD_ENDPOINT = "/tr/api/file/download/{attachment_id}"
+    FUND_DIRECTORY_URL = "https://kap.org.tr/tr/YatirimFonlari/ALL"
 
     REPORT_TITLE = "Portfoy Dagilim Raporu"
 
-    # GUIDs captured by reverse-engineering KAP's frontend network calls
-    # for each fund's disclosure page. There is no public lookup endpoint
-    # that resolves a bare fund code (e.g. "TLY") to these IDs, so new
-    # funds must be registered here manually.
+    # See "Endpoint discovery note" in the class docstring above: verified
+    # (2026-07-30) to work as a generic, fund-independent path segment for
+    # FILTER_ENDPOINT, not just for TLY.
+    GENERIC_MEMBER_OID = "8aca490d502e34b801502e380044002b"
+
+    # Small, hand-verified static override, checked before the dynamic
+    # directory (see class docstring). NOT the only supported funds
+    # anymore -- add an entry here only if you want to pin/document a
+    # specific fund manually; everything else is resolved dynamically.
     KNOWN_FUNDS: Dict[str, Dict[str, str]] = {
         "TLY": {
             "company_oid": "4028328c7812c9c301781bc5fe843290",
@@ -98,6 +125,29 @@ class KAPPdfDownloader:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+
+    # Regex over the raw, backslash-escaped JSON embedded in
+    # FUND_DIRECTORY_URL's server-rendered Next.js payload (inside a
+    # <script> tag -- this is NOT real DOM/table markup, so BeautifulSoup
+    # is used only to pull out <script> text, and this pattern parses the
+    # embedded data itself). Matches one `fundPermaLinks[]` entry at a
+    # time; field order (mkkMemberOid, kapMemberOid, permaLink, title,
+    # fundCode, fundOid) was verified stable across all 4483 entries found
+    # on the page on 2026-07-30. There is no public JSON/REST API for this
+    # listing -- this page is the only available source.
+    _FUND_DIRECTORY_ENTRY_PATTERN = re.compile(
+        r'\\"mkkMemberOid\\":(?:null|\\"(?P<mkk>[0-9a-fA-F]+)\\"),'
+        r'\\"kapMemberOid\\":\\"(?P<kap>[0-9A-Fa-f]+)\\",'
+        r'\\"permaLink\\":\\"(?P<permalink>[^"\\]*)\\",'
+        r'\\"title\\":\\"(?P<title>[^"\\]*)\\",'
+        r'\\"fundCode\\":\\"(?P<code>[A-Z0-9]{2,10})\\",'
+        r'\\"fundOid\\":\\"(?P<oid>[0-9A-Fa-f]+)\\"'
+    )
+
+    # Class-level cache: the dynamic directory is the same for every fund,
+    # so it's fetched at most once per process (see
+    # `build_dynamic_fund_directory`'s `force_refresh` to bypass this).
+    _dynamic_fund_directory_cache: Optional[Dict[str, Dict[str, str]]] = None
 
     # The attachment download endpoint responds with `Content-Type:
     # application/pdf` but the body is actually a Java-serialized `byte[]`
@@ -112,27 +162,38 @@ class KAPPdfDownloader:
     def __init__(
         self,
         fon_kodu: str = "TLY",
-        output_dir: str = "tly_pdfs",
+        output_dir: Optional[str] = None,
         request_delay: float = 0.5,
         timeout: int = 30,
+        use_dynamic_directory: bool = True,
     ):
         fon_kodu = fon_kodu.strip().upper()
-        if fon_kodu not in self.KNOWN_FUNDS:
+
+        fund_config = self.KNOWN_FUNDS.get(fon_kodu)
+        source = "statik (KNOWN_FUNDS)" if fund_config else None
+
+        if fund_config is None and use_dynamic_directory:
+            dynamic_directory = self.build_dynamic_fund_directory(timeout=timeout)
+            fund_config = dynamic_directory.get(fon_kodu)
+            source = "dinamik (KAP fon dizini)" if fund_config else None
+
+        if fund_config is None:
             supported = ", ".join(self.KNOWN_FUNDS)
             raise ValueError(
-                f"'{fon_kodu}' fonu icin KAP company/member OID bilgisi tanimli degil. "
-                f"Desteklenen fonlar: {supported}. Yeni bir fon eklemek icin "
-                "KNOWN_FUNDS sozlugune kayit ekleyin."
+                f"'{fon_kodu}' fonu ne statik KNOWN_FUNDS sozlugunde ({supported}) ne de "
+                f"KAP'in dinamik fon dizininde ({self.FUND_DIRECTORY_URL}) bulunamadi. "
+                "Fon kodunu kontrol edin ya da (opsiyonel) KNOWN_FUNDS'a manuel kayit ekleyin."
             )
 
         self.fon_kodu = fon_kodu
-        self.fund_config = self.KNOWN_FUNDS[fon_kodu]
-        self.output_dir = output_dir
+        self.fund_config = fund_config
+        self.output_dir = output_dir or f"{fon_kodu.lower()}_pdfs"
         self.request_delay = request_delay
         self.timeout = timeout
         self.session = self._build_session()
 
         os.makedirs(self.output_dir, exist_ok=True)
+        print(f"[BILGI] [{fon_kodu}] Fon kimligi kaynagi: {source}.")
 
     # --- Context manager support --------------------------------------------
 
@@ -145,6 +206,106 @@ class KAPPdfDownloader:
     def close(self) -> None:
         """Closes the underlying HTTP session/connection pool."""
         self.session.close()
+
+    # --- Dynamic fund directory (replaces hard-coded KNOWN_FUNDS) -------------
+
+    @classmethod
+    def build_dynamic_fund_directory(
+        cls, force_refresh: bool = False, timeout: int = 30
+    ) -> Dict[str, Dict[str, str]]:
+        """Scrapes KAP's public "Yatirim Fonlari" listing page
+        (`FUND_DIRECTORY_URL`) and returns a dynamic, code-keyed directory
+        for EVERY fund KAP tracks (verified 4483 entries on 2026-07-30) --
+        a drop-in dynamic replacement for the hand-maintained `KNOWN_FUNDS`
+        dict:
+
+            {
+                "TLY": {
+                    "company_oid": "4028328c7812c9c301781bc5fe843290",
+                    "member_oid": GENERIC_MEMBER_OID,
+                    "mkk_member_oid": "5553acdacf15471ba80c28eb45cdd9e7",
+                    "permalink": "tly-tera-portfoy-birinci-serbest-fon",
+                    "unvan": "TERA PORTFÖY BİRİNCİ SERBEST FON",
+                },
+                ...
+            }
+
+        The page is a Next.js app whose fund list is embedded as
+        backslash-escaped JSON inside an inline `<script>` tag rather than
+        as real DOM/table markup (there is no separate public JSON/REST
+        endpoint for it), so BeautifulSoup is used only to pull out every
+        `<script>` tag's raw text, which `_FUND_DIRECTORY_ENTRY_PATTERN`
+        then parses directly (see that pattern's docstring for why regex
+        is used here instead of `json.loads`).
+
+        Cached at the class level after the first successful call --
+        pass `force_refresh=True` to bypass/refresh it. `timeout` bounds
+        the one HTTP request this makes (KAP can be slow to respond).
+
+        Never raises: any network error, non-2xx response, or a page whose
+        structure no longer matches `_FUND_DIRECTORY_ENTRY_PATTERN` is
+        caught, logged as "[HATA]"/"[UYARI]", and results in an EMPTY dict
+        being returned -- callers (see `__init__`) then naturally fall
+        back to whatever is in the static `KNOWN_FUNDS` registry instead
+        of crashing.
+        """
+        if cls._dynamic_fund_directory_cache is not None and not force_refresh:
+            return cls._dynamic_fund_directory_cache
+
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": cls.USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+        )
+
+        try:
+            response = session.get(cls.FUND_DIRECTORY_URL, timeout=timeout)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            print(f"[HATA] Dinamik fon dizini alinamadi ({cls.FUND_DIRECTORY_URL}): {exc}")
+            return {}
+        finally:
+            session.close()
+
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            script_text = "\n".join(tag.get_text() for tag in soup.find_all("script"))
+        except Exception as exc:  # noqa: BLE001 - malformed HTML must never crash the caller
+            print(f"[HATA] Fon dizini sayfasi (HTML) ayristirilamadi: {exc}")
+            return {}
+
+        if not script_text.strip():
+            # Defensive fallback in case BeautifulSoup's <script> extraction
+            # comes up empty for some reason -- the regex below is applied
+            # directly against the raw response body instead.
+            script_text = response.text
+
+        directory: Dict[str, Dict[str, str]] = {}
+        for match in cls._FUND_DIRECTORY_ENTRY_PATTERN.finditer(script_text):
+            code = (match.group("code") or "").strip().upper()
+            if not code or code in directory:
+                continue
+            directory[code] = {
+                "company_oid": match.group("oid"),
+                "member_oid": cls.GENERIC_MEMBER_OID,
+                "mkk_member_oid": match.group("mkk") or "",
+                "permalink": match.group("permalink") or "",
+                "unvan": match.group("title") or "",
+            }
+
+        if not directory:
+            print(
+                f"[UYARI] Dinamik fon dizini bos dondu; KAP sayfa yapisi degismis olabilir "
+                f"({cls.FUND_DIRECTORY_URL})."
+            )
+        else:
+            print(f"[BILGI] Dinamik fon dizini olusturuldu: {len(directory)} fon bulundu.")
+
+        cls._dynamic_fund_directory_cache = directory
+        return directory
 
     # --- Session setup -------------------------------------------------------
 

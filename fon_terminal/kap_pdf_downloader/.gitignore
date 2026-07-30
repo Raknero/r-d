@@ -1,4 +1,5 @@
 tly_pdfs/
+*_pdfs/
 __pycache__/
 *.pyc
 parser_kontrol_raporu.html

@@ -3,8 +3,10 @@
 Standalone, isolated module for downloading a Turkish investment fund's
 monthly "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
 attachments from KAP (Kamuyu Aydinlatma Platformu / Public Disclosure
-Platform). Currently ships with the `TLY` (Tera Portfoy Birinci Serbest
-Fon) fund pre-registered.
+Platform). `TLY` (Tera Portfoy Birinci Serbest Fon) is the fund this
+project was built around and remains explicitly pinned, but as of
+2026-07-30 **any fund code KAP tracks works out of the box** via a
+dynamic fund directory -- see "Fund resolution" below.
 
 This directory lives inside `fon_terminal/` but is intentionally
 decoupled from the rest of the application -- it has its own
@@ -63,14 +65,54 @@ python kap_downloader.py
 PDFs are saved into a `tly_pdfs/` folder (created automatically) as
 `TLY_{YEAR}_{MONTH:02d}.pdf`, e.g. `TLY_2026_06.pdf`.
 
-## Adding a new fund
+## Fund resolution: static override + dynamic KAP directory (2026-07-30)
 
-`KAPPdfDownloader.KNOWN_FUNDS` maps a fund code to the two opaque GUIDs
-(`company_oid`, `member_oid`) KAP's filter endpoint requires. There is no
-public lookup that resolves a bare fund code to these IDs, so add new
-funds manually by capturing them from the fund's disclosure list page's
-network requests (the values that appear in the `FILTERYFBF/.../...`
-filter URL).
+`KAPPdfDownloader` used to support **only** funds manually registered in
+`KNOWN_FUNDS` (originally just `TLY`), because its filter endpoint scopes
+a fund via two opaque GUIDs (`company_oid`, `member_oid`) and there was no
+known public lookup that resolves a bare fund code to them. This was the
+blocker that made the Shadow Portfolio engine's co-filing funds (`DOH`,
+`T3B`, `THF`, `TMV`, `FSU`, `TGI` -- see `discover_related_funds` below)
+fail to download at all.
+
+**Resolved.** Two things, both verified live rather than assumed:
+
+1. **A public source for `company_oid` does exist**: KAP's own
+   `https://kap.org.tr/tr/YatirimFonlari/ALL` page (a Next.js app) embeds
+   every tracked fund's `fundCode` + `fundOid` as backslash-escaped JSON
+   inside an inline `<script>` tag (`fundPermaLinks`, 4483 entries
+   confirmed present on 2026-07-30) -- there's no separate REST/JSON
+   endpoint for it, this page IS the source. `build_dynamic_fund_directory()`
+   fetches it once per process (BeautifulSoup pulls the `<script>` text,
+   a regex parses the embedded records), caches the result at the class
+   level, and never raises -- a network/parsing failure just logs
+   `[HATA]`/`[UYARI]` and returns an empty dict.
+2. **The endpoint's `member_oid` segment turned out not to be
+   fund-specific at all.** It was originally assumed unique per
+   fund/manager (captured from TLY's own traffic). Live probing proved
+   that wrong: reusing TLY's exact `member_oid` value against a
+   completely unrelated fund/manager (Is Portfoy's `IHK`) and a random
+   sample of 12 other fund codes across several other companies still
+   returned each fund's own correct "Portfoy Dagilim Raporu" list in
+   every case where that fund actually publishes one. So this single
+   constant (`GENERIC_MEMBER_OID`) is reused for every dynamically
+   resolved fund -- only `company_oid` actually needs to vary.
+
+`KAPPdfDownloader.__init__` now resolves a fund code in two steps, in
+order: (1) the static `KNOWN_FUNDS` override (zero network cost -- kept
+for `TLY` and any fund worth pinning/documenting manually), then (2) the
+dynamic directory. If neither has the code, it raises a clear
+`ValueError` rather than guessing an ID. `output_dir` also now defaults
+to `{fon_kodu_lower}_pdfs/` instead of being hardcoded to `tly_pdfs/`, so
+each fund gets its own folder automatically (all `*_pdfs/` folders are
+gitignored).
+
+Net effect, verified end-to-end: of the Shadow Portfolio engine's 7
+discovered funds, 5 now resolve and download successfully (`TLY`, `DOH`,
+`THF`, `TMV`, `FSU` all have March 2026 reports; `T3B` and `TGI` are
+correctly skipped with `[UYARI]` because KAP genuinely has zero
+"Portfoy Dagilim Raporu" disclosures for them in the probed window --
+not a resolution failure). Before this fix it was 1 of 7 (`TLY` only).
 
 ---
 
@@ -154,6 +196,18 @@ footer row per table so the sum can be eyeballed against the PDF's own
 Running `python kap_pdf_parser.py` now does both steps: prints the parsed
 holdings to the console, then writes `parser_kontrol_raporu.html` into the
 current directory for visual verification.
+
+**Optional delta sections (2026-07-28):** `export_to_html` also accepts an
+optional `delta_report` dict (`{"fon_kodu", "baseline_period", "resolved",
+"unresolved", "updated_data"}`, produced by `kap_delta_engine.py` -- see
+below). When provided, the SAME `parser_kontrol_raporu.html` file gets
+three extra sections appended after the per-period grid -- "Kesinleşen
+Deltalar", "Çözülemeyen / Çoklu Fon Bildirimleri", "Güncel Portföy Son
+Durumu" -- instead of a second, separate HTML file. `delta_report=None`
+(the default) renders exactly the original per-period report with no
+extra sections, so this module still has zero import dependency on
+`kap_delta_engine.py` -- the caller passes plain dicts/lists, never the
+other module's dataclasses.
 
 ---
 
@@ -266,3 +320,63 @@ aggregate to one fund would require an allocation rule KAP's data doesn't
 provide (e.g. an AUM-proportional split), and fabricating one would
 silently corrupt the holdings numbers -- so this is left as an explicit,
 visible gap for a human to resolve rather than a silent guess.
+
+---
+
+## Shadow Portfolio engine, step 1: `discover_related_funds` (2026-07-30)
+
+The multi-fund `unresolved` disclosures above are also the answer to a
+different question: *which other funds share TLY's portfolio manager and
+therefore need their own baseline tracked?* `KAPDeltaEngine.
+discover_related_funds(unresolved)` scans every unresolved disclosure's
+"İlgili Fonlar" list and collects every unique fund code into a single,
+deduplicated array -- the target fund is always kept first (as a
+reference point), the rest in first-seen order:
+
+```python
+with KAPDeltaEngine(fon_kodu="TLY") as engine:
+    updated, resolved, unresolved = engine.apply_delta(baseline, start_date=..., end_date=...)
+    related_funds = engine.discover_related_funds(unresolved)
+    # ['TLY', 'DOH', 'T3B', 'THF', 'TMV', 'FSU', 'TGI']
+```
+
+Parsing is defensive by design (`_clean_fund_codes`): it accepts either
+an already-parsed `List[str]` (what `ParsedTransaction.related_funds`
+actually is) or raw delimited text (`"DOH, T3B, TLY"` / `"[DOH, T3B,
+TLY]"`), strips brackets/quotes/whitespace from every token, and drops
+anything that doesn't look like a real fund code -- so the result never
+carries a trailing space or stray character regardless of the input
+shape.
+
+## Shadow Portfolio engine, step 2: `collect_global_baseline` (2026-07-30)
+
+Once the related funds are known, `collect_global_baseline(related_funds,
+baseline_period)` (a module-level function, not tied to one fund's
+`KAPDeltaEngine` instance) builds a single same-period baseline snapshot
+across all of them by orchestrating the other two modules per fund:
+`KAPPdfDownloader` downloads that fund's PDF for the given `(year, donem)`
+period into its own `{fon_kodu_lower}_pdfs/` folder, then `KAPPdfParser`
+parses it, and the result is merged into one dict:
+
+```python
+global_baseline = collect_global_baseline(
+    related_funds,
+    baseline_period=(2026, 3),  # align every fund to the SAME period
+)
+# {"TLY": {"ALKLC": 731256.0, ...}, "DOH": {...}, "THF": {...}, ...}
+```
+
+**Never crashes on a bad fund**, by design: a fund with no registered/
+resolvable KAP identity, a failed/empty download for that period, or an
+empty parse result are all caught individually, logged as `[UYARI]`, and
+simply omitted from the result -- one bad fund never aborts the loop.
+Logs a final summary (`X/Y fon basariyla toplandi, Z benzersiz hisse kodu
+bulundu`).
+
+**`days_back` hard ceiling, discovered while testing this (2026-07-30):**
+KAP's `FILTERYFBF` endpoint silently returns an empty list (`HTTP 200`,
+`[]`, no error) for any `days_back` value of 366 or higher -- verified by
+probing 30/90/180/365/366/400, where 365 returned real disclosures and
+366+ returned zero every time. `collect_global_baseline` therefore
+defaults to `days_back=365` and should not be raised past that; an older
+`baseline_period` needs multiple windowed calls instead.
