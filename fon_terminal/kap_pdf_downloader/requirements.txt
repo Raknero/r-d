@@ -1,3 +1,8 @@
 requests==2.32.3
 pdfplumber==0.11.10
 beautifulsoup4==4.13.4
+
+# Only required for kap_delta_engine.py's build_tefas_power_matrix(), which
+# bridges to fon_terminal/data_scraper.py (one directory up) to reuse its
+# existing TEFAS scraper -- pinned to match fon_terminal/requirements.txt.
+playwright==1.61.0

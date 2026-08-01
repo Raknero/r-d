@@ -294,6 +294,82 @@ def _format_turkish_number(value: float) -> str:
     return us_formatted.replace(",", "\u0001").replace(".", ",").replace("\u0001", ".")
 
 
+def _format_tl_compact(value: float) -> str:
+    """Formats a TL amount in a human-scannable compact form for the TEFAS
+    Aktif Güç matrix, where raw values routinely run into the hundreds of
+    billions and a full thousands-grouped number would be hard to eyeball
+    across a wide multi-fund table:
+
+        231802010766.38  -> "231,80 Milyar TL"
+        454324080.94     -> "454,32 Milyon TL"
+        850000.0         -> "850.000,00 TL"
+
+    Falls back to the full Turkish-formatted number (+ " TL") below one
+    million, where a "Milyon"/"Milyar" suffix would lose too much
+    precision to be useful.
+    """
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000:
+        return f"{_format_turkish_number(value / 1_000_000_000)} Milyar TL"
+    if abs_value >= 1_000_000:
+        return f"{_format_turkish_number(value / 1_000_000)} Milyon TL"
+    return f"{_format_turkish_number(value)} TL"
+
+
+def _render_tefas_power_table(tefas_power_matrix: Dict[str, Dict[str, float]], fon_kodu: str = "") -> str:
+    """Renders `kap_delta_engine.build_tefas_power_matrix`'s output
+    (`{"TLY": {"2026-07-31": 191393702793.58, ...}, "DOH": {...}, ...}`) as
+    a single table: one row per date (most recent first), one column per
+    discovered fund code (target fund `fon_kodu` pinned first, the rest
+    alphabetical). A missing (fund, date) combination -- a day that fund
+    genuinely has no TEFAS Aktif Güç figure for (weekend/holiday, restricted
+    fund, or simply not yet scraped) -- renders as a plain "-", never a
+    fabricated 0.
+
+    Returns an explicit "veri bulunamadı" notice (never raises, never
+    renders a broken/empty table) if the matrix or its date set is empty.
+    """
+    if not tefas_power_matrix:
+        return '<p class="empty-notice">TEFAS Aktif Güç verisi bulunamadı.</p>'
+
+    fund_codes = sorted(tefas_power_matrix.keys())
+    if fon_kodu and fon_kodu in fund_codes:
+        fund_codes.remove(fon_kodu)
+        fund_codes.insert(0, fon_kodu)
+
+    all_dates = sorted({date_str for daily in tefas_power_matrix.values() for date_str in daily}, reverse=True)
+    if not all_dates:
+        return '<p class="empty-notice">TEFAS Aktif Güç verisi bulunamadı.</p>'
+
+    header_cells = "".join(f'<th class="num">{html.escape(code)}</th>' for code in fund_codes)
+
+    body_rows: List[str] = []
+    for date_str in all_dates:
+        data_cells = "".join(
+            f"""
+                <td class="num">{
+                    html.escape(_format_tl_compact(tefas_power_matrix[code][date_str]))
+                    if date_str in tefas_power_matrix.get(code, {}) else '-'
+                }</td>"""
+            for code in fund_codes
+        )
+        body_rows.append(
+            f"""
+              <tr>
+                <td>{html.escape(date_str)}</td>{data_cells}
+              </tr>"""
+        )
+
+    return f"""
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Tarih</th>{header_cells}</tr></thead>
+        <tbody>{''.join(body_rows)}
+        </tbody>
+      </table>
+      </div>"""
+
+
 def _holdings_table_html(holdings: Dict[str, float], code_header: str = "Hisse/Varlık Kodu") -> str:
     """Shared renderer for a simple {kod: lot} table with a TOPLAM footer
     row, used both by the per-period cards above and by the "Güncel
@@ -318,19 +394,65 @@ def _holdings_table_html(holdings: Dict[str, float], code_header: str = "Hisse/V
           </table>"""
 
 
+def _render_execution_log(execution_logs: Optional[List[Dict[str, str]]]) -> str:
+    """Renders `kap_delta_engine`'s step-by-step narrative log (see that
+    module's `_log_step` helper -- a list of `{"time": "HH:MM:SS",
+    "message": "..."}` entries appended at every critical point of the
+    pipeline: KAP baseline fetched, buy/sell disclosures scanned and
+    classified, related funds discovered, TEFAS Aktif Güç calculated, the
+    proportional-distribution formula applied, etc.) as a terminal-styled
+    vertical timeline, meant to be placed at the very TOP of the report --
+    before any data table -- so a reader can follow the full reasoning
+    chain (what was fetched, what formula was applied, why) before ever
+    looking at a number.
+
+    Returns an empty string (renders nothing at all, not even an empty
+    section) if there's simply no log to show -- e.g. a bare
+    `export_to_html(parsed_data)` call with no `delta_report`, or a
+    `delta_report` that predates this feature and has no
+    `execution_logs` key. This keeps the function fully backward
+    compatible with every existing call site.
+    """
+    if not execution_logs:
+        return ""
+
+    entries_html = "".join(
+        f"""
+          <li class="log-entry">
+            <span class="log-time">{html.escape(str(entry.get('time', '')))}</span>
+            <span class="log-message">{html.escape(str(entry.get('message', '')))}</span>
+          </li>"""
+        for entry in execution_logs
+    )
+
+    return f"""
+  <section class="execution-trace">
+    <h2>Adım Adım Hesaplama ve Çalışma Günlüğü <span class="badge">{len(execution_logs)} adım</span></h2>
+    <p class="section-desc">Aşağıdaki tablolara ulaşmadan önce sistemin izlediği tam mantık zinciri: KAP'tan hangi veri çekildi, hangi fonlar keşfedildi, hangi formüller hangi sırayla uygulandı.</p>
+    <ol class="log-timeline">{entries_html}
+    </ol>
+  </section>"""
+
+
 def _render_delta_sections(delta_report: dict) -> str:
-    """Renders the three `kap_delta_engine.KAPDeltaEngine.apply_delta`
-    sections (`export_to_html`'s `delta_report` argument) as extra
-    full-width `.period-card`-styled sections: Kesinlesen Deltalar,
-    Cozulemeyen/Coklu Fon Bildirimleri, and Guncel Portfoy Son Durumu.
-    Never raises: missing/empty lists are rendered as an explicit
-    "veri bulunamadi" notice rather than a broken table.
+    """Renders the `kap_delta_engine.KAPDeltaEngine` pipeline's sections
+    (`export_to_html`'s `delta_report` argument) as extra full-width
+    `.period-card`-styled sections: Kesinlesen Deltalar, Cozulemeyen/Coklu
+    Fon Bildirimleri, Oransal Olarak Dagitilan Coklu Fon Islemleri (from
+    `resolve_multi_fund_deltas`, optional), Guncel Portfoy Son Durumu, and
+    Gunluk Aktif Satin Alma Gucu (TEFAS Havuzu) (from
+    `build_tefas_power_matrix`, optional -- see `_render_tefas_power_table`).
+    Never raises: missing/empty lists (or a missing `tefas_power_matrix`)
+    are rendered as an explicit "veri bulunamadi" notice rather than a
+    broken table.
     """
     fon_kodu = delta_report.get("fon_kodu") or ""
     baseline_period = delta_report.get("baseline_period") or "?"
     resolved = delta_report.get("resolved") or []
     unresolved = delta_report.get("unresolved") or []
+    proportional = delta_report.get("proportionally_resolved") or []
     updated_data = delta_report.get("updated_data") or {}
+    tefas_power_matrix = delta_report.get("tefas_power_matrix") or {}
 
     if resolved:
         resolved_rows = "".join(
@@ -369,9 +491,41 @@ def _render_delta_sections(delta_report: dict) -> str:
             <tbody>{unresolved_rows}
             </tbody>
           </table>
-          <p class="warn-notice">Bu {len(unresolved)} bildirim birden fazla fonu aynı anda kapsadığı için '{html.escape(fon_kodu)}'a özel kırılım KAP verisinde mevcut değil; bu yüzden Güncel Portföy Son Durumu'na dahil edilmemiştir.</p>"""
+          <p class="warn-notice">Bu {len(unresolved)} bildirim birden fazla fonu aynı anda kapsadığı için '{html.escape(fon_kodu)}'a özel KESİN bir kırılım KAP verisinde mevcut değil. Aşağıdaki "Oransal Olarak Dağıtılan" bölümünde başarıyla tahmin edilenler Güncel Portföy Son Durumu'na dahil edilmiştir; TEFAS verisi eksik olduğu için tahmin edilemeyenler ise dışarıda bırakılmıştır.</p>"""
     else:
         unresolved_html = '<p class="empty-notice">Bu aralıkta çok-fonlu/çözülemeyen bir bildirim bulunamadı.</p>'
+
+    if proportional:
+        proportional_rows = "".join(
+            f"""
+              <tr>
+                <td>{html.escape(str(item.get('date', '')))}</td>
+                <td>{html.escape(str(item.get('ticker', '')))}</td>
+                <td>{html.escape(', '.join(item.get('related_funds') or []))}</td>
+                <td class="num">%{item.get('weight_pct', 0.0):.2f}</td>
+                <td class="num">{html.escape(_format_turkish_number(item.get('net_lot_total', 0.0) or 0.0))}</td>
+                <td class="num">{html.escape(_format_turkish_number(item.get('estimated_lot', 0.0) or 0.0))}</td>
+                <td class="{'dir-alim' if item.get('direction') == 'ALIM' else 'dir-satim' if item.get('direction') == 'SATIM' else ''}">{html.escape(str(item.get('direction', '')))}</td>
+              </tr>"""
+            for item in sorted(proportional, key=lambda item: item.get("date", ""))
+        )
+        proportional_html = f"""
+          <table>
+            <thead>
+              <tr>
+                <th>Tarih (İşlem Tarihi)</th><th>Hisse/Pay Kodu</th><th>İlgili Fonlar</th>
+                <th class="num">Havuz Payı</th><th class="num">Toplam Net Lot (Havuz)</th>
+                <th class="num">Tahmini Lot ({html.escape(fon_kodu)})</th><th>İşlem Yönü</th>
+              </tr>
+            </thead>
+            <tbody>{proportional_rows}
+            </tbody>
+          </table>"""
+    else:
+        proportional_html = '<p class="empty-notice">Oransal olarak dağıtılmış bir işlem bulunamadı.</p>'
+
+    tefas_power_html = _render_tefas_power_table(tefas_power_matrix, fon_kodu)
+    tefas_power_days = len({date_str for daily in tefas_power_matrix.values() for date_str in daily})
 
     return f"""
   <div class="delta-sections">
@@ -386,9 +540,19 @@ def _render_delta_sections(delta_report: dict) -> str:
       {unresolved_html}
     </section>
     <section class="period-card">
+      <h2>Oransal Olarak Dağıtılan Çoklu Fon İşlemleri <span class="badge ok">{len(proportional)} kayıt</span></h2>
+      <p class="section-desc">Yukarıdaki çözülemeyen bildirimler, İŞLEM TARİHİNDEKİ TEFAS "Aktif Güç" (AUM × (Hisse Senedi % + Likidite %)) değerlerine göre ilgili fonlar arasında ORANTILI olarak dağıtılmıştır. Bu bir TAHMİNDİR, KAP'ın kendi yayınladığı kesin bir rakam değildir.</p>
+      {proportional_html}
+    </section>
+    <section class="period-card">
       <h2>Güncel Portföy Son Durumu <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü + Kesinleşen Deltalar (Çözülemeyen bildirimler hariç).</p>
+      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü + Kesinleşen Deltalar + Oransal Olarak Dağıtılan Tahmini Deltalar.</p>
       {_holdings_table_html(updated_data, code_header="Hisse/Pay Kodu")}
+    </section>
+    <section class="period-card">
+      <h2>Günlük Aktif Satın Alma Gücü (TEFAS Havuzu) <span class="badge">{len(tefas_power_matrix)} fon &middot; {tefas_power_days} gün</span></h2>
+      <p class="section-desc">Her fonun o günkü TEFAS Aktif Gücü (AUM × (Hisse Senedi % + Likidite %)); yukarıdaki oransal dağıtımın hangi havuz rakamlarına dayandığını doğrulamak içindir. Verisi olmayan gün/fon hücreleri "-" ile gösterilir.</p>
+      {tefas_power_html}
     </section>
   </div>"""
 
@@ -408,8 +572,14 @@ def export_to_html(
     Optional `delta_report` extends the same file with the intra-month
     "Pay Alim Satim Bildirimi" results produced by
     `kap_delta_engine.KAPDeltaEngine.apply_delta` (see that module for how
-    they're computed), as three extra sections appended after the
-    per-period grid above -- this module has no import dependency on
+    they're computed): five extra sections (Kesinlesen Deltalar,
+    Cozulemeyen/Coklu Fon Bildirimleri, Oransal Olarak Dagitilan Coklu Fon
+    Islemleri, Guncel Portfoy Son Durumu, and Gunluk Aktif Satin Alma Gucu)
+    appended AFTER the per-period grid above, plus one more -- the "Adim
+    Adim Hesaplama ve Calisma Gunlugu" (Execution Trace) timeline -- placed
+    BEFORE everything else (even before the per-period grid), so a reader
+    sees the pipeline's full plain-language reasoning first and the raw
+    tables second. This module has no import dependency on
     `kap_delta_engine.py` itself, so the caller passes plain dicts/lists,
     shaped as:
 
@@ -420,15 +590,39 @@ def export_to_html(
                 {"date": "23/07/2026", "ticker": "BIGEN", "lot": 42469924.0, "direction": "ALIM"},
                 ...
             ],
-            "unresolved": [                             # multi-fund, NOT applied -- see kap_delta_engine's docstring
+            "unresolved": [                             # multi-fund, KAP never breaks these down per-fund
                 {"date": "02/07/2026", "related_funds": ["T3B", "TLY"], "companies": ["PEKGY"], "net_lot": 38176445.0},
                 ...
             ],
-            "updated_data": {"ALKLC": 731256.0, "BIGEN": 42469924.0, ...},  # baseline + resolved
+            "proportionally_resolved": [                # optional -- KAPDeltaEngine.resolve_multi_fund_deltas()
+                {"date": "02/07/2026", "ticker": "PEKGY", "related_funds": ["T3B", "TLY"],
+                 "pool_total": 950000000.0, "target_power": 187000000.0, "weight_pct": 19.68,
+                 "net_lot_total": 38176445.0, "estimated_lot": 7513744.6, "direction": "ALIM"},
+                ...
+            ],
+            "updated_data": {"ALKLC": 731256.0, "BIGEN": 42469924.0, ...},  # baseline + resolved + proportionally_resolved
+            "tefas_power_matrix": {                     # optional -- kap_delta_engine.build_tefas_power_matrix()
+                "TLY": {"2026-07-31": 191393702793.58, "2026-07-30": 187837027636.22, ...},
+                "DOH": {"2026-07-31": 449426747.01, ...},
+                ...
+            },
+            "execution_logs": [                          # optional -- see kap_delta_engine._log_step
+                {"time": "12:03:41", "message": "Adım 0 (Başlangıç Portföyü): ..."},
+                {"time": "12:03:58", "message": "Adım 1 tamamlandı: ..."},
+                ...
+            ],
         }
 
     Pass `delta_report=None` (the default) to render exactly the original
     per-period report with no extra sections -- fully backward compatible.
+    Likewise, omitting `tefas_power_matrix` or `execution_logs` from
+    `delta_report` simply renders that one extra section as an explicit
+    "veri bulunamadı" notice (or, for `execution_logs`, renders nothing at
+    all) rather than breaking the rest of the report. When present,
+    `execution_logs` is rendered as a terminal-styled vertical timeline at
+    the very TOP of the report -- before the per-period grid and every
+    delta section -- narrating the full pipeline in plain language before
+    any table is shown (see `_render_execution_log`).
 
     Writes the file to `output_filename` (relative paths are created in the
     current working directory) and also returns the generated HTML string.
@@ -439,6 +633,8 @@ def export_to_html(
     """
     generated_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     periods = sorted(parsed_data.keys())
+
+    execution_log_html = _render_execution_log(delta_report.get("execution_logs") if delta_report else None)
 
     sections: List[str] = []
     for period in periods:
@@ -619,6 +815,69 @@ def export_to_html(
   }}
   .dir-alim {{ color: #065f46; font-weight: 600; }}
   .dir-satim {{ color: #991b1b; font-weight: 600; }}
+  .table-scroll {{
+    overflow-x: auto;
+  }}
+  .table-scroll table {{
+    min-width: 640px;
+  }}
+  .execution-trace {{
+    max-width: 1200px;
+    margin: 0 auto 28px;
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: 20px 24px 24px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  }}
+  .execution-trace h2 {{
+    margin: 0 0 6px;
+    font-size: 16px;
+    color: #f1f5f9;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .execution-trace .section-desc {{
+    color: #94a3b8;
+    margin: 0 0 18px;
+  }}
+  .log-timeline {{
+    list-style: none;
+    margin: 0;
+    padding: 2px 0 2px 20px;
+    border-left: 2px solid #334155;
+  }}
+  .log-entry {{
+    position: relative;
+    padding: 0 0 16px 18px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }}
+  .log-entry:last-child {{
+    padding-bottom: 0;
+  }}
+  .log-entry::before {{
+    content: "";
+    position: absolute;
+    left: -25px;
+    top: 4px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #38bdf8;
+    box-shadow: 0 0 0 3px #0f172a, 0 0 0 4px #334155;
+  }}
+  .log-time {{
+    display: inline-block;
+    color: #38bdf8;
+    font-weight: 700;
+    margin-right: 10px;
+  }}
+  .log-message {{
+    color: #e2e8f0;
+  }}
 </style>
 </head>
 <body>
@@ -626,6 +885,7 @@ def export_to_html(
     <h1>KAP Portföy Dağılım Raporu &mdash; Kontrol Raporu</h1>
     <p>Oluşturulma zamanı: {html.escape(generated_at)} &middot; {len(periods)} dönem &middot; kap_pdf_parser.py tarafından otomatik üretildi</p>
   </header>
+  {execution_log_html}
   <div class="grid">{''.join(sections)}
   </div>
   {delta_sections_html}

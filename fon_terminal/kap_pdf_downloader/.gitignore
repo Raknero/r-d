@@ -1,5 +1,6 @@
 tly_pdfs/
 *_pdfs/
+tefas_cache.json
 __pycache__/
 *.pyc
 parser_kontrol_raporu.html

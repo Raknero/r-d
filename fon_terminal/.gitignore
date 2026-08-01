@@ -1,3 +1,6 @@
 __pycache__/
 *.json
 tefas_debug.html
+
+# Tamamen lokal, gizli geliştirici mimari notu -- Git ile ASLA takip edilmemeli.
+INTERNAL_ARCHITECTURE.md

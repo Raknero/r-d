@@ -29,6 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -390,12 +391,131 @@ class KAPPdfDownloader:
             if existing is None or record.publish_date > existing.publish_date:
                 best_by_period[period_key] = record
 
-        records = sorted(best_by_period.values(), key=lambda r: (r.year, r.donem))
+        # Sorted NEWEST-FIRST (descending) rather than the API's own,
+        # undocumented/occasionally-paginated ordering -- see
+        # `find_latest_report`, which additionally re-derives the true
+        # maximum via `date()` objects rather than trusting this order
+        # alone (belt-and-suspenders against a "Date Lag" bug like the one
+        # fixed 2026-07-31, where a stale local PDF silently stood in for
+        # the fund's actual latest published report).
+        records = sorted(best_by_period.values(), key=lambda r: (r.year, r.donem), reverse=True)
         print(
             f"[BILGI] [{self.fon_kodu}] {len(records)} adet '{self.REPORT_TITLE}' bulundu "
             f"(son {days_back} gun icinde)."
         )
         return records
+
+    def find_latest_report(self, days_back: int = 365) -> Optional[DisclosureRecord]:
+        """Explicitly determines the SINGLE most recently published
+        "Portfoy Dagilim Raporu" for this fund, by converting every
+        candidate disclosure's (year, donem) into a real `date(year,
+        donem, 1)` object and taking `max()` over them -- rather than
+        trusting `_fetch_disclosure_list`'s own sort order (which is
+        already newest-first, but KAP's underlying API has no documented
+        pagination/ordering guarantee, so re-deriving the true maximum
+        here costs nothing and removes any doubt).
+
+        Returns None (never raises) if no report was found at all within
+        `days_back` days.
+        """
+        records = self._fetch_disclosure_list(days_back)
+        if not records:
+            return None
+        return max(records, key=lambda r: date(r.year, r.donem, 1))
+
+    def _clean_old_reports(self, keep_period: Tuple[int, int]) -> None:
+        """Deletes every "{fon_kodu}_YYYY_MM.pdf" file already sitting in
+        `self.output_dir` whose (year, donem) period is NOT `keep_period`,
+        so a stale older-month report left over from a previous run can
+        never linger alongside (or be mistaken for) the freshly downloaded
+        latest one -- this is what `KAPPdfParser.parse_directory` would
+        otherwise pick up right alongside the new file.
+
+        Never raises: a file that can't be removed is logged as "[UYARI]"
+        and left in place rather than aborting the run.
+        """
+        if not os.path.isdir(self.output_dir):
+            return
+
+        pattern = re.compile(rf"^{re.escape(self.fon_kodu)}_(\d{{4}})_(\d{{2}})\.pdf$", re.IGNORECASE)
+        for filename in os.listdir(self.output_dir):
+            match = pattern.match(filename)
+            if not match:
+                continue
+            period = (int(match.group(1)), int(match.group(2)))
+            if period == keep_period:
+                continue
+
+            filepath = os.path.join(self.output_dir, filename)
+            try:
+                os.remove(filepath)
+                print(f"[TEMİZLİK] [{self.fon_kodu}] Eski (guncel olmayan) rapor silindi: {filename}")
+            except OSError as exc:
+                print(f"[UYARI] [{self.fon_kodu}] Eski rapor silinemedi ({filename}): {exc}")
+
+    def download_latest_report(self, days_back: int = 365, clean_old_files: bool = True) -> Optional[dict]:
+        """Downloads ONLY the single most recently published monthly
+        "Portfoy Dagilim Raporu" for this fund (see `find_latest_report`),
+        instead of every report found in the window.
+
+        This fixes the "Date Lag" bug (2026-07-31): `kap_delta_engine.
+        collect_global_baseline` used to infer a fund's baseline period
+        from whatever PDFs happened to already be sitting in its local
+        `{fon_kodu}_pdfs/` folder (e.g. a stale "2026_03" left over from
+        an earlier test run) instead of asking KAP what the fund's TRUE
+        latest published report is -- silently losing every month in
+        between (April/May/June...) as if they never existed.
+
+        If `clean_old_files` is True (the default), every OTHER
+        "{fon_kodu}_*.pdf" already in `self.output_dir` is deleted first
+        (see `_clean_old_reports`), so `KAPPdfParser.parse_directory()`
+        can never accidentally pick up a stale month alongside (or
+        instead of) the fresh one.
+
+        Returns a result dict `{"year", "donem", "status", "file"}` for
+        the single downloaded report, or None if no report could be found
+        at all (logged, never raised -- one fund's missing report must
+        never abort a caller looping over several funds).
+        """
+        print(f"[SISTEM] [{self.fon_kodu}] KAP'taki EN GUNCEL '{self.REPORT_TITLE}' araniyor...")
+
+        latest = self.find_latest_report(days_back=days_back)
+        if latest is None:
+            print(f"[SISTEM] [{self.fon_kodu}] Hicbir donem icin rapor bulunamadi.")
+            return None
+
+        keep_period = (latest.year, latest.donem)
+        if clean_old_files:
+            self._clean_old_reports(keep_period=keep_period)
+
+        local_filename = f"{self.fon_kodu}_{latest.year}_{latest.donem:02d}.pdf"
+        print(
+            f"\n[{self.fon_kodu}] {latest.year}/{latest.donem:02d} donemi (EN GUNCEL) isleniyor "
+            f"(disclosureIndex={latest.disclosure_index})..."
+        )
+
+        try:
+            resolved = self._resolve_attachment(latest.disclosure_index)
+            if not resolved:
+                print(f"[HATA] [{self.fon_kodu}] En guncel rapor icin PDF eki bulunamadi.")
+                return {
+                    "year": latest.year,
+                    "donem": latest.donem,
+                    "status": "error",
+                    "message": "PDF eki bulunamadi.",
+                }
+
+            attachment_id, _remote_filename = resolved
+            success = self._download_pdf(attachment_id, local_filename)
+        except Exception as exc:  # noqa: BLE001 - never let one fund's failure crash a caller's loop
+            print(f"[KRITIK HATA] [{self.fon_kodu}] En guncel rapor indirilirken beklenmeyen hata: {exc}")
+            return {"year": latest.year, "donem": latest.donem, "status": "error", "message": str(exc)}
+
+        if not success:
+            return {"year": latest.year, "donem": latest.donem, "status": "error", "file": None}
+
+        print(f"[SISTEM] [{self.fon_kodu}] En guncel baseline raporu bulundu: {latest.donem:02d}/{latest.year}")
+        return {"year": latest.year, "donem": latest.donem, "status": "success", "file": local_filename}
 
     # --- Stage 2: resolve the real attachment ID, then download --------------
 

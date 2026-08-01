@@ -65,6 +65,31 @@ from kap_downloader import KAPPdfDownloader
 from kap_pdf_parser import KAPPdfParser
 
 
+def _log_step(execution_logs: Optional[List[Dict[str, str]]], message: str) -> None:
+    """Appends one human-readable narrative entry to `execution_logs`, for
+    the "Adim Adim Hesaplama ve Calisma Gunlugu" (Execution Trace) section
+    `kap_pdf_parser._render_execution_log` renders at the top of
+    `parser_kontrol_raporu.html`.
+
+    This is DELIBERATELY separate from the module's existing `print(...)`
+    calls (which stay exactly as they were -- see every call site): the
+    console output is a detailed, per-disclosure/per-fund technical trace,
+    while `execution_logs` is a short, story-like narrative meant for a
+    non-technical reader to follow the pipeline's REASONING end to end
+    ("KAP'ta N bildirim bulundu, bunlardan X'i tek-fonlu oldugu icin
+    uygulandi, Y'si coklu fon oldugu icin ayri siniflandirildi", etc.),
+    without wading through every individual disclosure/day log line.
+
+    Never raises and is a pure no-op if `execution_logs` is None -- every
+    call site that doesn't care about logging (or is invoked without a
+    shared list) behaves EXACTLY as before this feature was added; nothing
+    about the existing data pipeline changes because of this function.
+    """
+    if execution_logs is None:
+        return
+    execution_logs.append({"time": datetime.now().strftime("%H:%M:%S"), "message": message})
+
+
 @dataclass
 class DeltaDisclosureRecord:
     """One "Pay Alim Satim Bildirimi" entry from KAP's general
@@ -95,6 +120,35 @@ class ResolvedDelta:
     transaction_date: str  # "DD/MM/YYYY"
     ticker: str
     lot_amount: float  # unsigned magnitude of the applied change
+    direction: str  # "ALIM" | "SATIM" | "DEGISIM YOK"
+
+
+@dataclass
+class ProportionalResolution:
+    """One multi-fund "Pay Alim Satim Bildirimi" transaction (originally
+    an `unresolved` `ParsedTransaction`) that `KAPDeltaEngine.
+    resolve_multi_fund_deltas` was able to attribute a share of to the
+    target fund, by weighting the disclosure's aggregate `net_nominal_tl`
+    proportionally to each co-filing fund's TEFAS "Aktif Guc" (active
+    purchasing power) ON THE TRANSACTION DATE (see that method's
+    docstring for the full "Zaman Cizelgesi" reasoning).
+
+    This is an ESTIMATE, not a KAP-confirmed per-fund figure -- KAP itself
+    never publishes one (see the module docstring's "UNRESOLVED DATA
+    LIMITATION" note). Kept distinct from `ResolvedDelta` (which only
+    covers unambiguous, KAP-confirmed single-fund transactions) so
+    reporting code can clearly label estimated vs. confirmed figures.
+    """
+
+    disclosure_index: int
+    transaction_date: str  # "DD/MM/YYYY"
+    ticker: str
+    related_funds: List[str]
+    pool_total_tl: float  # sum of every related fund's Aktif Guc that day
+    target_power_tl: float  # the target fund's own Aktif Guc that day
+    target_weight_pct: float  # target_power_tl / pool_total_tl * 100
+    net_lot_total: float  # the disclosure's own aggregate net_nominal_tl
+    estimated_lot: float  # net_lot_total * (target_weight_pct / 100), signed
     direction: str  # "ALIM" | "SATIM" | "DEGISIM YOK"
 
 
@@ -172,6 +226,7 @@ class KAPDeltaEngine:
         fon_kodu: str = "TLY",
         request_delay: float = 0.5,
         timeout: int = 30,
+        execution_logs: Optional[List[Dict[str, str]]] = None,
     ):
         fon_kodu = fon_kodu.strip().upper()
         if fon_kodu not in self.MANAGER_MKK_MEMBER_OID:
@@ -188,6 +243,17 @@ class KAPDeltaEngine:
         self.timeout = timeout
         self.session = self._build_session()
         self.discovered_related_funds: List[str] = []  # populated by discover_related_funds()
+
+        # "Execution Trace" narrative log (see `_log_step`'s docstring) --
+        # shared, mutable list: pass one in (e.g. `execution_logs=[]`
+        # created in `__main__`, before this engine even exists) so every
+        # step across THIS instance's methods AND the module-level
+        # `collect_global_baseline`/`build_tefas_power_matrix` functions
+        # (which accept the same parameter) narrate into one single,
+        # chronologically-ordered story. Defaults to a fresh private list
+        # if the caller doesn't supply one, so existing call sites that
+        # never pass `execution_logs` behave exactly as before.
+        self.execution_logs: List[Dict[str, str]] = execution_logs if execution_logs is not None else []
 
     # --- Context manager support --------------------------------------------
 
@@ -488,6 +554,15 @@ class KAPDeltaEngine:
 
         self.discovered_related_funds = discovered
         print(f"[KEŞİF] [{self.fon_kodu}] Keşif Aşaması Tamamlandı. Hedef Fonlar Dizisi: {discovered}")
+
+        other_funds = [code for code in discovered if code != self.fon_kodu]
+        _log_step(
+            self.execution_logs,
+            f"Adım 2 (Keşif): Çözülemeyen {len(unresolved)} çoklu-fon bildiriminin 'İlgili Fonlar' "
+            f"listeleri tarandı; {self.fon_kodu} ile aynı portföy yönetim şirketine bağlı "
+            f"{len(other_funds)} 'kardeş' fon tespit edildi: {', '.join(other_funds) or 'yok'}. "
+            "Bu fonların her biri için ayrı bir KAP baseline'ı ve TEFAS verisi toplanacak.",
+        )
         return discovered
 
     @staticmethod
@@ -539,6 +614,11 @@ class KAPDeltaEngine:
            deliberately not merged into `updated_data`.
         """
         print(f"[SISTEM] [{self.fon_kodu}] Delta motoru calisiyor: {start_date} -> {end_date}...")
+        _log_step(
+            self.execution_logs,
+            f"Adım 1: {self.fon_kodu}'nin portföy yönetim şirketine ait KAP 'Pay Alım Satım "
+            f"Bildirimi' duyuruları {start_date} – {end_date} aralığında tarandı.",
+        )
 
         disclosures = self._fetch_delta_disclosures(start_date, end_date)
 
@@ -548,6 +628,10 @@ class KAPDeltaEngine:
 
         if not disclosures:
             print(f"[SISTEM] [{self.fon_kodu}] Uygulanacak bildirim bulunamadi; baseline degistirilmedi.")
+            _log_step(
+                self.execution_logs,
+                "Adım 1 tamamlandı: bu aralıkta hiç bildirim bulunamadı, baseline değiştirilmedi.",
+            )
             return updated_data, resolved, unresolved
 
         for index, record in enumerate(disclosures):
@@ -587,7 +671,184 @@ class KAPDeltaEngine:
             f"[SISTEM] [{self.fon_kodu}] Tamamlandi: {len(disclosures)} bildirim islendi -> "
             f"{len(resolved)} tek-fonlu (uygulandi), {len(unresolved)} cok-fonlu/belirsiz (uygulanmadi)."
         )
+
+        multi_fund_examples = sorted(
+            {code for txn in unresolved for code in (txn.related_funds or []) if code != self.fon_kodu}
+        )
+        examples_str = ", ".join(multi_fund_examples[:5]) + (" vb." if len(multi_fund_examples) > 5 else "")
+        _log_step(
+            self.execution_logs,
+            f"Adım 1 tamamlandı: {self.fon_kodu}'nin yöneticisine ait pay alım/satım bildirimleri "
+            f"tarandı, {len(disclosures)} bildirim bulundu. Bunların içinden sadece {self.fon_kodu}'yı "
+            f"kapsayan {len(resolved)} işlem doğrudan baseline'a uygulandı (kesinleşen delta); "
+            f"birden fazla fonu ({examples_str or 'başka fon içermeyen'}) aynı anda kapsayan "
+            f"{len(unresolved)} bildirim ise KAP'ta fon bazlı kırılım olmadığı için ayrı, "
+            "'çözülemedi' olarak sınıflandırıldı.",
+        )
         return updated_data, resolved, unresolved
+
+    # --- Step 4: proportional resolution of multi-fund transactions -----------
+
+    @staticmethod
+    def _transaction_date_to_iso(transaction_date: str) -> Optional[str]:
+        """Converts a KAP transaction date string ("DD/MM/YYYY", as parsed
+        by `_parse_html_table`) into "YYYY-MM-DD" so it can be looked up
+        directly in a `tefas_power_matrix` (see `build_tefas_power_matrix`,
+        which keys its per-fund dict by that same ISO format). Returns
+        None (never raises) for anything that isn't a clean DD/MM/YYYY
+        string.
+        """
+        if not transaction_date or not isinstance(transaction_date, str):
+            return None
+        parts = transaction_date.split("/")
+        if len(parts) != 3:
+            return None
+        day, month, year = parts
+        try:
+            return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        except ValueError:
+            return None
+
+    def resolve_multi_fund_deltas(
+        self,
+        unresolved: List[ParsedTransaction],
+        tefas_power_matrix: Dict[str, Dict[str, float]],
+        updated_data: Dict[str, float],
+    ) -> Tuple[Dict[str, float], List[ProportionalResolution]]:
+        """"Zaman Cizelgesi" (Chronological Ledger) asamasi: `apply_delta()`
+        tarafindan KAP verisinde fon bazli kirilimi olmadigi icin
+        (bkz. modul docstring'indeki "UNRESOLVED DATA LIMITATION")
+        uygulanamayan `unresolved` (cok-fonlu) islemleri, KAP'in hic
+        yayinlamadigi bu kirilimi TAHMIN ETMEK icin, o gunku TEFAS "Aktif
+        Guc" (bkz. `build_tefas_power_matrix`) degerleriyle ORANTILI olarak
+        dagitir.
+
+        Her `ParsedTransaction` icin mantik:
+
+        A) Zamanlama: KAP'in kendi "Bildirim Tarihi" (disclosure'un
+           yayinlandigi an, islemden GUNLER SONRA olabilir) DEGIL,
+           bildirimin kendi icindeki "Islem Tarihi" (`transaction_date`)
+           kullanilir. O gunun TEFAS verisi (`Tarih`), bir onceki gecenin
+           kapanisini -- yani ilgili fonun islem sabahindaki gercek
+           "muhimmatini" -- yansitir; bu yuzden dogru referans budur.
+        B) Havuz: Islemin `related_funds` listesindeki HER fonun o gunku
+           Aktif Gucu toplanarak "Toplam Guc Havuzu" olusturulur.
+        C) Hesaplama: Hedef fonun (self.fon_kodu) bu havuzdaki agirligi
+           `hedef_guc / toplam_havuz` olarak bulunur; islemin toplam
+           `net_nominal_tl` (KAP'in tek, birlesik TL rakami) degeri bu
+           agirlikla carpilarak hedef fona ait TAHMINI net lot bulunur.
+        D) Kayit: Tahmini miktar, girdi olarak alinan `updated_data`
+           sozlugunun (baseline + apply_delta'nin tek-fonlu `resolved`
+           sonuclari) UZERINE eklenir (input mutate edilmez, yeni bir dict
+           dondurulur) ve raporlama icin ayrica bir `ProportionalResolution`
+           listesi olarak da dondurulur.
+
+        Hicbir zaman crash etmez / ZeroDivisionError riski tasimaz: bir
+        islemin `related_funds` listesindeki fonlardan HERHANGI BIRI icin o
+        gune ait TEFAS Aktif Gucu bulunamazsa (eksik veri, hafta sonu,
+        henuz taranmamis fon vb.), ya da bulunan gucler toplaninca "Toplam
+        Havuz" 0 (veya negatif) cikarsa, o TEK islem acikca Turkce bir
+        "[UYARI]" log'u ile atlanir ve diger islemlere devam edilir --
+        eksik bir fon icin sessizce 0 varsayip havuzu kucultmek, diger
+        fonlarin payini yapay olarak sisirir, bu yuzden boyle bir islem
+        HICBIR SEKILDE kismi/tahmini olarak dagitilmaz.
+        """
+        result = dict(updated_data)
+        proportionally_resolved: List[ProportionalResolution] = []
+
+        _log_step(
+            self.execution_logs,
+            f"Adım 5 (Zaman Çizelgesi): {len(unresolved)} çözülemeyen çoklu-fon bildirimi için, "
+            "işlem tarihindeki TEFAS 'Aktif Güç' (AUM × (Hisse Senedi % + Likidite %)) değerleri "
+            "kullanılarak oransal dağıtım formülü uygulanıyor: Havuz Payı = Hedef Fonun Aktif Gücü "
+            "/ İlgili Fonların Toplam Aktif Gücü; Tahmini Lot = Toplam Net Lot × Havuz Payı.",
+        )
+
+        for txn in unresolved:
+            iso_date = self._transaction_date_to_iso(txn.transaction_date)
+            if not iso_date:
+                print(
+                    f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index}: "
+                    f"gecersiz/eksik islem tarihi ({txn.transaction_date!r}), islem atlaniyor."
+                )
+                continue
+
+            related_funds = txn.related_funds or []
+            if self.fon_kodu not in related_funds:
+                print(
+                    f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index}: hedef fon "
+                    f"'İlgili Fonlar' listesinde yok ({related_funds}), islem atlaniyor."
+                )
+                continue
+
+            fund_powers: Dict[str, float] = {}
+            missing_funds: List[str] = []
+            for fund_code in related_funds:
+                power = (tefas_power_matrix.get(fund_code) or {}).get(iso_date)
+                if power is None:
+                    missing_funds.append(fund_code)
+                else:
+                    fund_powers[fund_code] = power
+
+            if missing_funds:
+                print(
+                    f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index} ({iso_date}): "
+                    f"su fon(lar) icin TEFAS Aktif Guc verisi yok: {missing_funds}; Toplam Guc Havuzu "
+                    "guvenilir sekilde hesaplanamadigi icin islem atlaniyor."
+                )
+                continue
+
+            pool_total = sum(fund_powers.values())
+            if pool_total <= 0:
+                print(
+                    f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index} ({iso_date}): "
+                    f"Toplam Guc Havuzu {pool_total:,.2f} TL (sifir/negatif) cikti, "
+                    "ZeroDivisionError riski nedeniyle islem atlaniyor."
+                )
+                continue
+
+            if txn.net_nominal_tl is None:
+                print(
+                    f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index} ({iso_date}): "
+                    "net nominal tutar (net_nominal_tl) eksik, islem atlaniyor."
+                )
+                continue
+
+            target_power = fund_powers[self.fon_kodu]
+            target_weight = target_power / pool_total
+            estimated_lot = txn.net_nominal_tl * target_weight
+            direction = "ALIM" if estimated_lot > 0 else "SATIM" if estimated_lot < 0 else "DEGISIM YOK"
+
+            for company in txn.traded_companies or ["BILINMEYEN"]:
+                result[company] = result.get(company, 0.0) + estimated_lot
+                proportionally_resolved.append(
+                    ProportionalResolution(
+                        disclosure_index=txn.disclosure_index,
+                        transaction_date=txn.transaction_date,
+                        ticker=company,
+                        related_funds=related_funds,
+                        pool_total_tl=pool_total,
+                        target_power_tl=target_power,
+                        target_weight_pct=target_weight * 100.0,
+                        net_lot_total=txn.net_nominal_tl,
+                        estimated_lot=estimated_lot,
+                        direction=direction,
+                    )
+                )
+
+        print(
+            f"[SISTEM] [{self.fon_kodu}] Oransal Dagitim Tamamlandi: {len(unresolved)} cozulemeyen "
+            f"islemden {len(proportionally_resolved)} kayit orantili olarak dagitildi."
+        )
+        skipped = len(unresolved) - len(proportionally_resolved)
+        _log_step(
+            self.execution_logs,
+            f"Adım 5 tamamlandı: {len(unresolved)} çözülemeyen işlemden {len(proportionally_resolved)} "
+            f"tanesi orantılı olarak dağıtılıp {self.fon_kodu}'nın güncel portföyüne eklendi; "
+            f"{skipped} tanesi ilgili fon(lar) için o güne ait TEFAS Aktif Güç verisi eksik olduğu "
+            "(veya havuz sıfır/negatif çıktığı) için TAHMİN EDİLMEDEN atlandı.",
+        )
+        return result, proportionally_resolved
 
 
 
@@ -596,14 +857,13 @@ class KAPDeltaEngine:
 
 def collect_global_baseline(
     related_funds: List[str],
-    baseline_period: Tuple[int, int],
     days_back: int = 365,
-) -> Dict[str, Dict[str, float]]:
+    execution_logs: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Tuple[int, int]]]:
     """Orchestrates `kap_downloader.KAPPdfDownloader` + `kap_pdf_parser.
     KAPPdfParser` across every fund code in `related_funds` (typically
     `KAPDeltaEngine.discover_related_funds()`'s output) to build a single
-    "Golge Portfoy" global baseline snapshot, all aligned to the SAME
-    monthly "Portfoy Dagilim Raporu" period:
+    "Golge Portfoy" global baseline snapshot:
 
         global_baseline = {
             "TLY": {"ALKLC": 731256.0, ...},
@@ -611,36 +871,66 @@ def collect_global_baseline(
             ...
         }
 
-    `baseline_period` is an inclusive `(year, donem)` pair (e.g. `(2026, 3)`
-    for March 2026) -- typically the target fund's own latest parsed PDF
-    period -- so every fund in the result represents the same point in
-    time. Each fund's PDF(s) are downloaded into their own
-    `{fon_kodu_lower}_pdfs/` folder (e.g. `doh_pdfs/`, `t3b_pdfs/`), kept
-    separate from `tly_pdfs/` and from each other.
+    "Date Lag" fix (2026-07-31): each fund now uses `KAPPdfDownloader.
+    download_latest_report()` to find and download ITS OWN most recently
+    published monthly "Portfoy Dagilim Raporu" -- there is no shared,
+    externally-supplied `baseline_period` anymore. Funds legitimately
+    publish on different schedules (e.g. TLY's latest report might be
+    June 2026 while DOH's is May 2026), so forcing every fund onto the
+    SAME period (as this function used to do, taking it from whatever the
+    caller passed in) silently misses months for any fund whose true
+    latest report is newer than that shared period -- which is exactly
+    what happened when the caller derived that period from a stale local
+    `tly_pdfs/` folder instead of asking KAP directly. See the second
+    return value below for exactly which period ended up being used per
+    fund.
+
+    Each fund's PDF is downloaded into its own `{fon_kodu_lower}_pdfs/`
+    folder (e.g. `doh_pdfs/`, `t3b_pdfs/`), kept separate from `tly_pdfs/`
+    and from each other; any older-month PDF already sitting there from a
+    previous run is deleted first (see `download_latest_report`'s own
+    `clean_old_files` behavior), so a stale file can never be parsed
+    alongside the fresh one.
 
     `days_back` defaults to 365 and should not be raised past that: KAP's
     FILTERYFBF endpoint silently returns an empty list (HTTP 200, `[]`,
     no error) for any `days_back` value of 366 or higher -- verified live
     (2026-07-30) by probing 30/90/180/365/366/400, where 365 returned 13
-    TLY disclosures and 366+ returned 0. If `baseline_period` is ever
-    older than ~1 year, split the call across multiple date windows
-    instead of raising this value.
+    TLY disclosures and 366+ returned 0.
+
+    Returns a 2-tuple `(global_baseline, baseline_periods)`, where
+    `baseline_periods` maps each successfully baselined fund code to the
+    `(year, donem)` tuple of the report that was actually used, e.g.
+    `{"TLY": (2026, 6), "DOH": (2026, 5)}` -- funds can legitimately
+    differ here, by design.
 
     Never raises and never aborts the loop: a fund missing from
     `KAPPdfDownloader.KNOWN_FUNDS` (no registered KAP OID -- true today
     for every discovered fund except TLY itself), a download failure, or
-    an empty/missing parse result for the target period are all caught,
+    an empty/missing parse result for its latest period are all caught,
     logged as "[UYARI]", and treated as "skip this fund, keep going" --
-    the returned dict simply omits that fund's entry rather than crashing
+    the returned dicts simply omit that fund's entry rather than crashing
     or fabricating data for it.
+
+    `execution_logs` (optional, default None): a shared list (see
+    `_log_step`) that this function appends short narrative entries to --
+    one per fund, plus a start/end summary -- for the HTML "Execution
+    Trace" section. Purely additive: omitting it changes nothing about
+    this function's return value or behavior.
     """
-    year, donem = baseline_period
-    period_key = f"{year}_{donem:02d}"
     global_baseline: Dict[str, Dict[str, float]] = {}
+    baseline_periods: Dict[str, Tuple[int, int]] = {}
 
     print(
-        f"\n[SISTEM] Global Baseline Toplama Basladi: {len(related_funds)} fon, "
-        f"hedef donem={period_key}"
+        f"\n[SISTEM] Global Baseline Toplama Basladi: {len(related_funds)} fon "
+        "(her fon KENDI en guncel raporunu kullanacak)."
+    )
+    _log_step(
+        execution_logs,
+        f"Adım 3 (Global Baseline): Keşfedilen {len(related_funds)} fonun "
+        f"({', '.join(related_funds)}) her biri için KAP'tan KENDİ en güncel 'Portföy Dağılım "
+        "Raporu' PDF'i indirilip ayrıştırılacak; bu, oransal dağıtımın dayanacağı 'Global "
+        "Baseline'ı oluşturur.",
     )
 
     for fon_kodu in related_funds:
@@ -648,11 +938,7 @@ def collect_global_baseline(
 
         try:
             with KAPPdfDownloader(fon_kodu=fon_kodu, output_dir=output_dir) as downloader:
-                download_results = downloader.download_reports(
-                    days_back=days_back,
-                    start_period=baseline_period,
-                    end_period=baseline_period,
-                )
+                download_result = downloader.download_latest_report(days_back=days_back)
         except ValueError as exc:
             # Fund not registered in KNOWN_FUNDS (no KAP company/member OID
             # captured for it yet) -- an honest gap, not a bug; never guess
@@ -663,9 +949,16 @@ def collect_global_baseline(
             print(f"[UYARI] [{fon_kodu}] PDF indirme sirasinda beklenmeyen hata, atlaniyor: {exc}")
             continue
 
-        if not any(r.get("status") == "success" for r in download_results):
-            print(f"[UYARI] [{fon_kodu}] {period_key} donemine ait PDF KAP'ta bulunamadi/indirilemedi, atlaniyor.")
+        if not download_result or download_result.get("status") != "success":
+            print(f"[UYARI] [{fon_kodu}] KAP'ta en guncel rapor bulunamadi/indirilemedi, atlaniyor.")
+            _log_step(
+                execution_logs,
+                f"{fon_kodu}: KAP'ta güncel bir 'Portföy Dağılım Raporu' bulunamadı/indirilemedi, "
+                "bu fon Global Baseline dışında bırakıldı.",
+            )
             continue
+
+        period_key = f"{download_result['year']}_{download_result['donem']:02d}"
 
         try:
             history = KAPPdfParser().parse_directory(output_dir)
@@ -679,14 +972,277 @@ def collect_global_baseline(
             continue
 
         global_baseline[fon_kodu] = holdings
-        print(f"[BASARILI] [{fon_kodu}] {period_key} baseline'i toplandi ({len(holdings)} hisse kodu).")
+        baseline_periods[fon_kodu] = (download_result["year"], download_result["donem"])
+        print(f"[BASARILI] [{fon_kodu}] {period_key} (EN GUNCEL) baseline'i toplandi ({len(holdings)} hisse kodu).")
+        _log_step(
+            execution_logs,
+            f"{fon_kodu}: {period_key.replace('_', '/')} dönemine ait en güncel Portföy Dağılım "
+            f"Raporu indirildi ve ayrıştırıldı ({len(holdings)} hisse kodu bulundu).",
+        )
 
     all_tickers = {ticker for holdings in global_baseline.values() for ticker in holdings}
     print(
         f"\n[SISTEM] Global Baseline Toplama Tamamlandi: {len(global_baseline)}/{len(related_funds)} fon "
         f"basariyla toplandi, {len(all_tickers)} benzersiz hisse kodu bulundu."
     )
-    return global_baseline
+    _log_step(
+        execution_logs,
+        f"Adım 3 tamamlandı: {len(global_baseline)}/{len(related_funds)} fon için Global Baseline "
+        f"başarıyla toplandı, toplam {len(all_tickers)} benzersiz hisse kodu bulundu.",
+    )
+    return global_baseline, baseline_periods
+
+
+# --- Step 3: daily TEFAS "buying power" (equity TL exposure) per fund -------
+
+
+def _tarih_ddmmyyyy_to_iso(tarih: Optional[str]) -> Optional[str]:
+    """Converts data_scraper.py's stored "DD.MM.YYYY" date string into
+    "YYYY-MM-DD" (the key format `build_tefas_power_matrix` uses, matching
+    the task's own `tefas_power_matrix` example). Returns None (rather
+    than raising) for anything that isn't a clean DD.MM.YYYY string."""
+    if not tarih or not isinstance(tarih, str):
+        return None
+    parts = tarih.split(".")
+    if len(parts) != 3:
+        return None
+    day, month, year = parts
+    try:
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    except ValueError:
+        return None
+
+
+LIQUIDITY_ASSET_KEYWORDS: Tuple[str, ...] = ("repo", "para piyasası", "mevduat")
+
+
+def _tr_lower(text) -> str:
+    """Same Turkish-casing-safe lowercasing as `KAPDeltaEngine._normalize`
+    (plain "İ"/"I" -> "i" before `.lower()`), used here for
+    keyword-matching Varliklar asset names rather than HTML table headers.
+    """
+    return str(text).replace("İ", "i").replace("I", "i").lower()
+
+
+def _liquidity_ratio_pct(varliklar: Dict[str, float]) -> float:
+    """Sums every `Varliklar` percentage whose asset name matches a known
+    liquidity/cash-equivalent category, for the "Likidite Orani" term of
+    the Aktif Guc formula (see `build_tefas_power_matrix`):
+
+    - "repo"          -> matches BOTH "Repo" and "Ters-Repo" ("Repo-Trepo"
+                         combined, as a single fon-industry concept), added
+                         with their own sign (a fund that borrowed via repo
+                         has a NEGATIVE "Repo" %, which correctly reduces
+                         net liquidity rather than being ignored).
+    - "para piyasası"  -> matches money-market lines regardless of naming
+                         era: TEFAS_DISTRIBUTION_MAP currently emits
+                         "Borsa İstanbul Para Piyasası" for both the "bpp"
+                         and "tpp" abbreviations, which is the successor
+                         name to what used to be called "Takasbank Para
+                         Piyasası" -- matching on the shared "Para
+                         Piyasası" substring is robust to either naming.
+    - "mevduat"        -> matches any deposit line (e.g. "Mevduat (TL)").
+
+    Returns 0.0 (never raises, and never treated as "missing/unknown") if
+    none of these are present in `varliklar` -- per spec, absent liquidity
+    components simply mean 0% liquidity contribution, unlike a wholly
+    missing `Varliklar` dict (handled by the caller before this is ever
+    invoked).
+    """
+    total = 0.0
+    for asset_name, pct in varliklar.items():
+        if not any(keyword in _tr_lower(asset_name) for keyword in LIQUIDITY_ASSET_KEYWORDS):
+            continue
+        try:
+            total += float(pct)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def build_tefas_power_matrix(
+    fund_codes: List[str],
+    days_back: int = 30,
+    execution_logs: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Adim 3 of the Shadow Portfolio pipeline: for every fund code passed
+    in (typically the FULL `discover_related_funds()` output, not just the
+    subset that also happened to have a KAP PDF baseline -- a fund like
+    T3B/TGI can have daily TEFAS data even with no monthly report), pulls
+    the last `days_back` days of TEFAS AUM ("Toplam Deger") and portfolio
+    distribution ("Hisse Senedi" %, plus liquidity lines) via the
+    project's existing, already-working TEFAS scraper
+    (`fon_terminal/data_scraper.py`, one directory up from this sandbox --
+    see the "Bridging to data_scraper.py" note below), and turns that into
+    a daily "Aktif Guc" (active purchasing power) figure per fund -- not
+    just the equity portion, but equity PLUS cash-like liquidity, since
+    both are capital a fund can actually deploy into a shared pool of
+    stock being bought/sold by its manager:
+
+        Aktif_Guc_TL = Toplam_AUM * (Hisse_Senedi_Orani + Likidite_Orani) / 100
+
+    where Likidite_Orani is the sum of every liquidity-category percentage
+    in that day's `Varliklar` (see `_liquidity_ratio_pct`: "Repo"/"Ters-
+    Repo", any "... Para Piyasası" money-market line, and "Mevduat").
+
+    Returns a nested dict keyed by fund code then ISO date:
+
+        {"TLY": {"2026-07-23": 187837027636.22, ...}, "THF": {...}, ...}
+
+    Bridging to data_scraper.py: this is the one place in the
+    kap_pdf_downloader sandbox that intentionally breaks its own "no
+    dependency on fon_terminal's own modules" rule (see this folder's
+    README) -- TEFAS AUM/distribution data only exists in that module, and
+    duplicating its Playwright WAF-bypass logic here would be a
+    maintenance hazard, not an improvement. The import is done lazily
+    (only when this function actually runs) via a `sys.path` bridge to the
+    parent `fon_terminal/` directory, so nothing else in this sandbox
+    requires `playwright` to be installed. `data_scraper.DATABASE_FILE` is
+    also redirected to a dedicated `tefas_cache.json` inside THIS folder
+    (never the app's real `fon_terminal/fund_database.json`) so this
+    exploratory pipeline can never add an unrequested fund tab to the live
+    dashboard or otherwise mutate production data as a side effect.
+
+    Never raises: a total TEFAS handshake failure (`data_scraper.
+    scrape_and_update` can raise `RuntimeError` if Playwright can't get a
+    session at all), a specific fund's scrape failing (e.g. an invalid
+    TEFAS code such as a fund that only exists at KAP), a fund with no
+    stored records, a malformed/missing date, a missing AUM figure, or an
+    unparseable percentage are all caught individually, logged as
+    "[UYARI]", and result in that fund/day being skipped -- never a crash.
+
+    Note on a missing "Hisse Senedi" key specifically (as opposed to a
+    wholly missing/empty "Varliklar" dict): the former means the fund sold
+    off its entire equity position that day, so 0% is treated as the
+    correct value (not missing data); the latter means TEFAS returned no
+    distribution breakdown at all for that day (e.g. a restricted/
+    qualified fund) and is treated as genuinely unknown, so that day is
+    skipped rather than assuming 0% -- same distinction already documented
+    in `fon_terminal/README.md`'s "Handling Incomplete Financial Data".
+    Missing liquidity components, unlike missing equity data, are always
+    treated as 0% (see `_liquidity_ratio_pct`), per this feature's spec.
+
+    `execution_logs` (optional, default None): a shared list (see
+    `_log_step`) that this function appends short narrative entries to
+    for the HTML "Execution Trace" section. Purely additive: omitting it
+    changes nothing about this function's return value or behavior.
+    """
+    import os
+    import sys
+
+    sandbox_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(sandbox_dir)  # fon_terminal/
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    try:
+        import data_scraper
+    except ImportError as exc:
+        print(f"[HATA] TEFAS veri modulu (fon_terminal/data_scraper.py) import edilemedi: {exc}")
+        return {}
+
+    # Redirect to a sandbox-local cache file -- see docstring above for why
+    # this must never point at the live app's fund_database.json.
+    data_scraper.DATABASE_FILE = os.path.join(sandbox_dir, "tefas_cache.json")
+
+    print(
+        f"\n[SISTEM] TEFAS Gunluk Aktif Guc Matrisi hesaplaniyor: "
+        f"{len(fund_codes)} fon, son {days_back} gun."
+    )
+    _log_step(
+        execution_logs,
+        f"Adım 4 (TEFAS Aktif Güç): {len(fund_codes)} fon için son {days_back} günün TEFAS AUM "
+        "ve portföy dağılımı verisi çekiliyor; her gün için Aktif_Güç_TL = Toplam_AUM × "
+        "(Hisse Senedi % + Likidite %) formülü uygulanacak (Likidite % = Repo/Ters-Repo + Para "
+        "Piyasası + Mevduat).",
+    )
+
+    try:
+        scrape_results = data_scraper.scrape_and_update(fund_codes, days_back=days_back)
+    except Exception as exc:  # noqa: BLE001 - a total TEFAS handshake failure must never abort the caller
+        print(f"[UYARI] TEFAS verisi cekilemedi (tum fonlar icin, oturum acilamadi olabilir): {exc}")
+        _log_step(
+            execution_logs,
+            f"Adım 4 başarısız: TEFAS oturumu (Playwright handshake) açılamadığı için hiçbir fon "
+            f"için Aktif Güç hesaplanamadı ({exc}).",
+        )
+        return {}
+
+    database = data_scraper.load_database()
+
+    tefas_power_matrix: Dict[str, Dict[str, float]] = {}
+    successful_funds = 0
+
+    for fund_code in fund_codes:
+        fund_code = fund_code.strip().upper()
+        status = (scrape_results.get(fund_code) or {}).get("status")
+        if status != "success":
+            message = (scrape_results.get(fund_code) or {}).get("message", "bilinmeyen hata")
+            print(f"[UYARI] [{fund_code}] TEFAS verisi cekilemedi ({message}), atlaniyor.")
+            continue
+
+        records = ((database.get(fund_code) or {}).get("records")) or []
+        if not records:
+            print(f"[UYARI] [{fund_code}] TEFAS onbelleginde kayit bulunamadi, atlaniyor.")
+            continue
+
+        gunluk_aktif_guc: Dict[str, float] = {}
+        for record in records:
+            iso_date = _tarih_ddmmyyyy_to_iso(record.get("Tarih"))
+            if not iso_date:
+                print(f"[UYARI] [{fund_code}] gecersiz/eksik tarih, bu gun atlaniyor: {record.get('Tarih')!r}")
+                continue
+
+            varliklar = record.get("Varliklar")
+            if not varliklar:
+                # Wholly missing distribution data (TEFAS weekend/holiday
+                # gap, or a restricted/qualified fund) -- genuinely
+                # unknown, never assumed to be 0%.
+                print(f"[UYARI] [{fund_code}] {iso_date}: portfoy dagilim verisi yok, gun atlaniyor.")
+                continue
+
+            aum = record.get("ToplamDeger")
+            if aum is None:
+                print(f"[UYARI] [{fund_code}] {iso_date}: ToplamDeger (AUM) eksik, gun atlaniyor.")
+                continue
+
+            # Present Varliklar dict but no "Hisse Senedi" key specifically
+            # means the fund held 0% equities that day -- a real value,
+            # not missing data (see docstring). Missing liquidity lines are
+            # always 0% (see _liquidity_ratio_pct's own docstring).
+            hisse_yuzdesi = varliklar.get("Hisse Senedi", 0.0)
+            likidite_yuzdesi = _liquidity_ratio_pct(varliklar)
+
+            try:
+                toplam_oran = float(hisse_yuzdesi) + float(likidite_yuzdesi)
+                gunluk_aktif_guc[iso_date] = float(aum) * (toplam_oran / 100.0)
+            except (TypeError, ValueError) as exc:
+                print(f"[UYARI] [{fund_code}] {iso_date}: aktif guc hesaplanamadi ({exc}), gun atlaniyor.")
+                continue
+
+        if not gunluk_aktif_guc:
+            print(f"[UYARI] [{fund_code}] kullanilabilir hicbir gun bulunamadi, atlaniyor.")
+            continue
+
+        tefas_power_matrix[fund_code] = gunluk_aktif_guc
+        successful_funds += 1
+        print(f"[BASARILI] [{fund_code}] {len(gunluk_aktif_guc)} gunluk aktif guc (TL) hesaplandi.")
+
+    all_days = {day for daily in tefas_power_matrix.values() for day in daily}
+    total_fund_days = sum(len(daily) for daily in tefas_power_matrix.values())
+    print(
+        f"\n[SISTEM] TEFAS Gunluk Aktif Guc Matrisi Tamamlandi: "
+        f"{successful_funds}/{len(fund_codes)} fon basariyla islendi, "
+        f"{len(all_days)} farkli gun kapsandi (toplam {total_fund_days} fon-gun kaydi)."
+    )
+    _log_step(
+        execution_logs,
+        f"Adım 4 tamamlandı: {successful_funds}/{len(fund_codes)} fon için TEFAS Aktif Güç "
+        f"hesaplandı, toplam {len(all_days)} farklı gün kapsandı ({total_fund_days} fon-gün kaydı). "
+        "Bu değerler, bir sonraki adımda çözülemeyen çoklu-fon işlemlerinin oransal dağıtımında "
+        "havuz büyüklüğünü belirlemek için kullanılacak.",
+    )
+    return tefas_power_matrix
 
 
 if __name__ == "__main__":
@@ -696,21 +1252,57 @@ if __name__ == "__main__":
 
     FON_KODU = "TLY"
 
-    # Real baseline: the latest monthly "Portfoy Dagilim Raporu" already
-    # downloaded into tly_pdfs/, parsed by KAPPdfParser (not a hardcoded
-    # stand-in) -- this is the same parse_directory() call
-    # kap_pdf_parser.py's own __main__ block uses.
+    # "Execution Trace" narrative log (see `_log_step`) -- one single
+    # shared list, created BEFORE anything else runs, that every step of
+    # this pipeline (this __main__ block itself, KAPDeltaEngine's methods,
+    # and the module-level collect_global_baseline/build_tefas_power_matrix
+    # functions) appends short, human-readable story entries into. Passed
+    # into `export_to_html`'s `delta_report` at the very end so the HTML
+    # report can render the FULL step-by-step reasoning, not just the
+    # final tables -- see kap_pdf_parser._render_execution_log.
+    execution_logs: List[Dict[str, str]] = []
+
+    # "Date Lag" fix (2026-07-31): simply parsing whatever PDFs already
+    # happened to sit in tly_pdfs/ from a previous run (`max(history)`)
+    # silently locked the baseline to a stale month (e.g. March) even
+    # though KAP had since published newer reports. TLY's own EN GUNCEL
+    # ("most recent") report is now explicitly (re)downloaded here via
+    # KAPPdfDownloader.download_latest_report() -- which also deletes any
+    # older cached PDF for this fund -- before ever parsing tly_pdfs/, so
+    # the baseline always reflects what KAP has published TODAY, not
+    # whatever happened to be on disk.
+    _log_step(
+        execution_logs,
+        f"Adım 0 (Başlangıç Portföyü): '{FON_KODU}' için KAP'ta en güncel 'Portföy Dağılım "
+        "Raporu' aranıyor (diskte önceden var olan dosyalara güvenilmiyor, KAP'a doğrudan "
+        "soruluyor).",
+    )
+    with KAPPdfDownloader(fon_kodu=FON_KODU) as tly_downloader:
+        tly_latest = tly_downloader.download_latest_report()
+
+    if not tly_latest or tly_latest.get("status") != "success":
+        raise SystemExit(
+            f"'{FON_KODU}' icin KAP'ta en guncel 'Portfoy Dagilim Raporu' bulunamadi/indirilemedi; "
+            "durduruluyor."
+        )
+
     parser = KAPPdfParser()
     history = parser.parse_directory("tly_pdfs")
 
-    if not history:
+    latest_period = f"{tly_latest['year']}_{tly_latest['donem']:02d}"
+    baseline_data = history.get(latest_period) or {}
+
+    if not baseline_data:
         raise SystemExit(
-            "tly_pdfs/ icinde ayristirilabilir bir rapor bulunamadi; "
-            "once kap_downloader.py ile en az bir PDF indirilmis olmali."
+            f"'{latest_period}' donemi indirildi ama ayristirilan veri bos donuyor; durduruluyor."
         )
 
-    latest_period = max(history)
-    baseline_data = history[latest_period]
+    _log_step(
+        execution_logs,
+        f"Adım 0 tamamlandı: {FON_KODU} için {latest_period.replace('_', '/')} dönemine ait en "
+        f"güncel rapor bulundu ve indirildi ({len(baseline_data)} hisse kodu). Bu, sistemin "
+        "başlangıç ('baseline') portföyünü oluşturur.",
+    )
 
     print("=== KAPDeltaEngine + KAPPdfParser Entegre Test ===")
     print(f"Baseline donemi: {latest_period}  ({len(baseline_data)} kod)\n")
@@ -718,7 +1310,7 @@ if __name__ == "__main__":
     end = date.today()
     start = end - timedelta(days=30)
 
-    with KAPDeltaEngine(fon_kodu=FON_KODU) as engine:
+    with KAPDeltaEngine(fon_kodu=FON_KODU, execution_logs=execution_logs) as engine:
         updated_data, resolved, unresolved = engine.apply_delta(
             baseline_data,
             start_date=start.isoformat(),
@@ -751,10 +1343,11 @@ if __name__ == "__main__":
     related_funds_target_array = engine.discover_related_funds(unresolved)
 
     print("\n=== Adım 2: Global Baseline Toplama ===")
-    baseline_year, baseline_donem = (int(part) for part in latest_period.split("_"))
-    global_baseline = collect_global_baseline(
-        related_funds_target_array,
-        baseline_period=(baseline_year, baseline_donem),
+    # Her fon artik KENDI en guncel raporunu kullaniyor (bkz.
+    # collect_global_baseline'in guncellenmis docstring'i) -- tek, ortak
+    # bir baseline_period ZORLANMIYOR.
+    global_baseline, baseline_periods = collect_global_baseline(
+        related_funds_target_array, execution_logs=execution_logs
     )
     print("\n=== Global Baseline Özeti ===")
     for fund_code in related_funds_target_array:
@@ -762,7 +1355,59 @@ if __name__ == "__main__":
         if holdings is None:
             print(f"  {fund_code:8s}  -> VERI YOK (atlandi)")
         else:
-            print(f"  {fund_code:8s}  -> {len(holdings)} hisse kodu")
+            period = baseline_periods.get(fund_code)
+            period_label = f"{period[1]:02d}/{period[0]}" if period else "?"
+            print(f"  {fund_code:8s}  -> {len(holdings)} hisse kodu  (donem: {period_label})")
+
+    print("\n=== Adım 3: TEFAS Günlük Aktif Güç Matrisi ===")
+    # BUG FIX (2026-07-30): Adım 2'de KAP PDF baseline'ı bulunamayan fonlar
+    # (T3B, TGI) TEFAS'ta hala gecerli, gunluk veri yayinlayan fonlar
+    # olabilir -- sadece global_baseline.keys() (PDF'i olanlar) yerine,
+    # kesif asamasinin TAM listesi (related_funds_target_array) gonderilir,
+    # boylece TEFAS kapsamı KAP PDF kapsamiyla gereksiz yere sinirlanmaz.
+    tefas_power_matrix = build_tefas_power_matrix(
+        related_funds_target_array, days_back=30, execution_logs=execution_logs
+    )
+
+    print("\n=== TEFAS Aktif Güç Matrisi Özeti ===")
+    for fund_code in related_funds_target_array:
+        gunluk_aktif_guc = tefas_power_matrix.get(fund_code)
+        if not gunluk_aktif_guc:
+            print(f"  {fund_code:8s}  -> VERI YOK (atlandi)")
+            continue
+        latest_day = max(gunluk_aktif_guc)
+        print(
+            f"  {fund_code:8s}  -> {len(gunluk_aktif_guc)} gun  "
+            f"(son gun {latest_day}: {gunluk_aktif_guc[latest_day]:,.2f} TL Aktif Guc)"
+        )
+
+    print("\n=== Adım 4: Çoklu Fon İşlemlerinin Oransal Dağıtımı (Zaman Çizelgesi) ===")
+    # `engine`'in (yukarida `with` bloğu ile kapatılmış) requests.Session'ı
+    # burada gerekmiyor -- resolve_multi_fund_deltas tamamen zaten elde
+    # edilmiş `unresolved`/`tefas_power_matrix` verisi üzerinde çalışan saf
+    # bir hesaplama metodu, ağ erişimi yapmaz -- bu yüzden yeni bir
+    # KAPDeltaEngine açmak yerine aynı `engine` nesnesi yeniden kullanılır.
+    updated_data, proportionally_resolved = engine.resolve_multi_fund_deltas(
+        unresolved, tefas_power_matrix, updated_data
+    )
+
+    print(f"\n=== Oransal olarak dağıtılan kayıtlar: {len(proportionally_resolved)} ===")
+    for item in proportionally_resolved[:10]:
+        print(
+            f"  {item.transaction_date}  {item.ticker:<8}  havuz_payi=%{item.target_weight_pct:>6.2f}  "
+            f"tahmini_lot={item.estimated_lot:>+15,.2f}  {item.direction}  "
+            f"ilgili_fonlar={item.related_funds}"
+        )
+    if len(proportionally_resolved) > 10:
+        print(f"  ... ve {len(proportionally_resolved) - 10} tane daha.")
+
+    print("\n=== Nihai Portföy (Baseline + Tek-Fonlu + Oransal Dağıtım) ===")
+    all_codes = sorted(set(baseline_data) | set(updated_data))
+    for code in all_codes:
+        before = baseline_data.get(code, 0.0)
+        after = updated_data.get(code, 0.0)
+        delta = after - before
+        print(f"{code:8s}  Onceki: {before:>15,.2f}   Delta: {delta:>+15,.2f}   Sonraki: {after:>15,.2f}")
 
     # Reshape into the plain dict/list shapes kap_pdf_parser.export_to_html
     # expects, so that module keeps zero hard dependency on this one's
@@ -780,6 +1425,20 @@ if __name__ == "__main__":
         }
         for txn in unresolved
     ]
+    proportional_plain = [
+        {
+            "date": item.transaction_date,
+            "ticker": item.ticker,
+            "related_funds": item.related_funds,
+            "pool_total": item.pool_total_tl,
+            "target_power": item.target_power_tl,
+            "weight_pct": item.target_weight_pct,
+            "net_lot_total": item.net_lot_total,
+            "estimated_lot": item.estimated_lot,
+            "direction": item.direction,
+        }
+        for item in proportionally_resolved
+    ]
 
     print()
     export_to_html(
@@ -790,6 +1449,9 @@ if __name__ == "__main__":
             "baseline_period": latest_period,
             "resolved": resolved_plain,
             "unresolved": unresolved_plain,
+            "proportionally_resolved": proportional_plain,
             "updated_data": updated_data,
+            "tefas_power_matrix": tefas_power_matrix,
+            "execution_logs": execution_logs,
         },
     )

@@ -11,10 +11,23 @@ dynamic fund directory -- see "Fund resolution" below.
 This directory lives inside `fon_terminal/` but is intentionally
 decoupled from the rest of the application -- it has its own
 `requirements.txt` and does not import anything from `fon_terminal/`'s
-own modules (`data_scraper.py`, `main.py`, etc.). The three modules here
-(`kap_downloader.py`, `kap_pdf_parser.py`, `kap_delta_engine.py`) only
-depend on each other and third-party packages, so the whole folder can
-still be lifted into another project as a self-contained unit.
+own modules (`data_scraper.py`, `main.py`, etc.), with exactly one
+documented exception (`build_tefas_power_matrix`, see Step 3 below). The
+three modules here (`kap_downloader.py`, `kap_pdf_parser.py`,
+`kap_delta_engine.py`) only depend on each other and third-party
+packages, so the whole folder can still be lifted into another project as
+a self-contained unit.
+
+Beyond the base download/parse pair, this sandbox has grown into a full
+**"Shadow Portfolio" pipeline**: `kap_delta_engine.py` bridges the gap
+between KAP's monthly PDF reports by layering intra-month buy/sell
+disclosures on top of them (Step 0-1), discovers every other fund sharing
+the target fund's portfolio manager (Step 2), collects each of their own
+baselines (Step 2), pulls their daily TEFAS purchasing power (Step 3),
+and proportionally resolves the multi-fund transactions KAP never breaks
+down per fund (Step 4) -- with every step narrated in plain language via
+an "Execution Trace" log rendered at the top of the final HTML report (see
+below).
 
 ## How it works
 
@@ -197,17 +210,37 @@ Running `python kap_pdf_parser.py` now does both steps: prints the parsed
 holdings to the console, then writes `parser_kontrol_raporu.html` into the
 current directory for visual verification.
 
-**Optional delta sections (2026-07-28):** `export_to_html` also accepts an
-optional `delta_report` dict (`{"fon_kodu", "baseline_period", "resolved",
-"unresolved", "updated_data"}`, produced by `kap_delta_engine.py` -- see
-below). When provided, the SAME `parser_kontrol_raporu.html` file gets
-three extra sections appended after the per-period grid -- "Kesinleşen
-Deltalar", "Çözülemeyen / Çoklu Fon Bildirimleri", "Güncel Portföy Son
-Durumu" -- instead of a second, separate HTML file. `delta_report=None`
-(the default) renders exactly the original per-period report with no
-extra sections, so this module still has zero import dependency on
-`kap_delta_engine.py` -- the caller passes plain dicts/lists, never the
-other module's dataclasses.
+**Optional delta sections (2026-07-28, extended through 2026-08-01):**
+`export_to_html` also accepts an optional `delta_report` dict (produced by
+`kap_delta_engine.py` -- see below), shaped as `{"fon_kodu",
+"baseline_period", "resolved", "unresolved", "proportionally_resolved",
+"updated_data", "tefas_power_matrix", "execution_logs"}`. When provided,
+the SAME `parser_kontrol_raporu.html` file gets extended with, in order:
+
+1. **"Adım Adım Hesaplama ve Çalışma Günlüğü" (Execution Trace)** -- a
+   terminal-styled vertical timeline placed at the very TOP of the report,
+   before every table, narrating the whole pipeline in plain language
+   (see "Execution Trace" section below).
+2. **"Kesinleşen Deltalar"** -- single-fund, KAP-confirmed transactions
+   applied to the baseline.
+3. **"Çözülemeyen / Çoklu Fon Bildirimleri"** -- multi-fund disclosures
+   KAP never breaks down per fund.
+4. **"Oransal Olarak Dağıtılan Çoklu Fon İşlemleri"** -- the subset of (3)
+   that `resolve_multi_fund_deltas` was able to estimate proportionally
+   (see Step 4 below).
+5. **"Güncel Portföy Son Durumu"** -- baseline + (2) + (4).
+6. **"Günlük Aktif Satın Alma Gücü (TEFAS Havuzu)"** -- the raw
+   `tefas_power_matrix` values that (4)'s weighting was based on, one row
+   per date (most recent first), one column per fund.
+
+`delta_report=None` (the default) renders exactly the original per-period
+report with no extra sections; any individual key missing from
+`delta_report` (e.g. an older caller that predates `tefas_power_matrix` or
+`execution_logs`) just renders that one section as an explicit "veri
+bulunamadı" notice (or, for `execution_logs`, renders nothing at all)
+rather than breaking the rest of the report. This module still has zero
+import dependency on `kap_delta_engine.py` -- the caller passes plain
+dicts/lists, never the other module's dataclasses.
 
 ---
 
@@ -250,16 +283,18 @@ from kap_delta_engine import KAPDeltaEngine
 baseline = KAPPdfParser().parse_file("tly_pdfs/TLY_2026_06.pdf")
 
 with KAPDeltaEngine(fon_kodu="TLY") as engine:
-    updated, unresolved = engine.apply_delta(baseline, start_date="2026-06-01", end_date="2026-07-28")
+    updated, resolved, unresolved = engine.apply_delta(baseline, start_date="2026-06-01", end_date="2026-07-28")
 
 # `updated` only reflects disclosures that named TLY exclusively.
+# `resolved` is one ResolvedDelta per ticker actually merged into `updated`.
 # `unresolved` is every multi-fund disclosure, fully parsed but not
-# merged -- see "Data limitation" below before assuming `updated` is complete.
+# merged -- see "Data limitation" below (and Step 4 above, which CAN
+# resolve some of these proportionally) before assuming `updated` is complete.
 ```
 
-Or run it directly (uses a hardcoded `{"SVGYO": 10000.0}` baseline and
-prints an "Onceki -> Delta -> Sonraki" comparison plus the full list of
-unresolved multi-fund disclosures for the last 30 days):
+Or run it directly (downloads TLY's own latest KAP baseline, runs the full
+Steps 0-4 pipeline against the last 30 days, and writes
+`parser_kontrol_raporu.html`):
 
 ```bash
 python kap_delta_engine.py
@@ -348,35 +383,165 @@ anything that doesn't look like a real fund code -- so the result never
 carries a trailing space or stray character regardless of the input
 shape.
 
-## Shadow Portfolio engine, step 2: `collect_global_baseline` (2026-07-30)
+## Shadow Portfolio engine, step 2: `collect_global_baseline` (2026-07-30, revised 2026-07-31)
 
 Once the related funds are known, `collect_global_baseline(related_funds,
-baseline_period)` (a module-level function, not tied to one fund's
-`KAPDeltaEngine` instance) builds a single same-period baseline snapshot
-across all of them by orchestrating the other two modules per fund:
-`KAPPdfDownloader` downloads that fund's PDF for the given `(year, donem)`
-period into its own `{fon_kodu_lower}_pdfs/` folder, then `KAPPdfParser`
-parses it, and the result is merged into one dict:
+days_back=365)` (a module-level function, not tied to one fund's
+`KAPDeltaEngine` instance) builds a "Global Baseline" snapshot across all
+of them by orchestrating the other two modules per fund: `KAPPdfDownloader`
+downloads that fund's OWN most recently published PDF into its own
+`{fon_kodu_lower}_pdfs/` folder, then `KAPPdfParser` parses it, and the
+result is merged into one dict:
 
 ```python
-global_baseline = collect_global_baseline(
-    related_funds,
-    baseline_period=(2026, 3),  # align every fund to the SAME period
-)
-# {"TLY": {"ALKLC": 731256.0, ...}, "DOH": {...}, "THF": {...}, ...}
+global_baseline, baseline_periods = collect_global_baseline(related_funds)
+# global_baseline:  {"TLY": {"ALKLC": 731256.0, ...}, "DOH": {...}, ...}
+# baseline_periods: {"TLY": (2026, 6), "DOH": (2026, 5), ...}  # funds can legitimately differ here
 ```
 
+**"Date Lag" fix (2026-07-31):** the first version of this function took a
+single, externally-supplied `baseline_period` and forced every fund onto
+that SAME period. This broke the moment that period was derived from
+whatever happened to already be sitting in a local `tly_pdfs/` folder
+(e.g. a stale March report left over from an earlier dev session) instead
+of asking KAP what its actual latest publication was -- funds legitimately
+publish on different schedules, so forcing a shared period meant any fund
+whose true latest report was newer than that period silently lost every
+month in between. The fix: each fund now calls `KAPPdfDownloader.
+download_latest_report()` (see that module's own section above), which
+queries KAP directly, converts every candidate disclosure's `(year,
+donem)` into a real `date()` object, and takes the genuine `max()` --
+then deletes any other PDF already sitting in that fund's folder so a
+stale file can never be parsed alongside the fresh one. The second return
+value, `baseline_periods`, records exactly which `(year, donem)` ended up
+being used per fund, since they are no longer forced to match.
+
 **Never crashes on a bad fund**, by design: a fund with no registered/
-resolvable KAP identity, a failed/empty download for that period, or an
-empty parse result are all caught individually, logged as `[UYARI]`, and
-simply omitted from the result -- one bad fund never aborts the loop.
-Logs a final summary (`X/Y fon basariyla toplandi, Z benzersiz hisse kodu
-bulundu`).
+resolvable KAP identity, a failed/empty download, or an empty parse result
+are all caught individually, logged as `[UYARI]`, and simply omitted from
+the result -- one bad fund never aborts the loop. Logs a final summary
+(`X/Y fon basariyla toplandi, Z benzersiz hisse kodu bulundu`).
 
 **`days_back` hard ceiling, discovered while testing this (2026-07-30):**
 KAP's `FILTERYFBF` endpoint silently returns an empty list (`HTTP 200`,
 `[]`, no error) for any `days_back` value of 366 or higher -- verified by
 probing 30/90/180/365/366/400, where 365 returned real disclosures and
 366+ returned zero every time. `collect_global_baseline` therefore
-defaults to `days_back=365` and should not be raised past that; an older
-`baseline_period` needs multiple windowed calls instead.
+defaults to `days_back=365` and should not be raised past that.
+
+## Shadow Portfolio engine, step 3: `build_tefas_power_matrix` (2026-07-30)
+
+Knowing WHICH stocks a fund holds isn't enough to weigh a multi-fund
+transaction -- that also needs to know HOW MUCH capital each co-filing
+fund actually has to deploy, day by day. `build_tefas_power_matrix
+(fund_codes, days_back=30)` (module-level, called with the FULL discovered
+fund list from step 1 -- not just the subset that also had a KAP PDF
+baseline, since a fund like `T3B`/`TGI` can have daily TEFAS data with no
+monthly report at all) pulls the last `days_back` days of TEFAS AUM
+("Toplam Deger") and portfolio distribution for every fund via this
+project's existing TEFAS scraper, then computes a daily "Aktif Güç"
+(active purchasing power) figure per fund:
+
+```python
+Aktif_Guc_TL = Toplam_AUM * (Hisse_Senedi_Orani + Likidite_Orani) / 100
+```
+
+`Likidite_Orani` sums every liquidity-category percentage in that day's
+`Varliklar` (Repo/Ters-Repo, any "... Para Piyasası" money-market line,
+and Mevduat) -- not just the equity percentage -- because a fund's real
+ability to participate in a joint buy/sell isn't just its existing stock
+position, it's stock PLUS readily deployable cash (see `INTERNAL_
+ARCHITECTURE.md`, item 13, for the full reasoning behind including
+liquidity here).
+
+```python
+tefas_power_matrix = build_tefas_power_matrix(related_funds_target_array, days_back=30)
+# {"TLY": {"2026-07-31": 191393702793.58, ...}, "DOH": {...}, ...}
+```
+
+**Bridging out of the sandbox, on purpose:** this is the one place in
+`kap_pdf_downloader/` that intentionally imports `fon_terminal/
+data_scraper.py` (via a lazy `sys.path` bridge) -- TEFAS AUM/distribution
+data only exists there, and reimplementing its Playwright WAF-bypass logic
+here would be a maintenance hazard. `data_scraper.DATABASE_FILE` is
+redirected to a sandbox-local `tefas_cache.json` (gitignored) for the
+duration of the call, so this exploratory pipeline can never write an
+unrequested fund into the live app's `fund_database.json` or add a
+surprise tab to the real dashboard.
+
+**Never crashes:** a total TEFAS handshake failure, a specific fund's
+scrape failing, a fund with no stored records, a malformed/missing date,
+a missing AUM figure, or an unparseable percentage are all caught
+individually, logged as `[UYARI]`, and result in that fund/day being
+skipped. A `Varliklar` dict that's present but missing the "Hisse Senedi"
+key specifically is treated as a real 0% (the fund sold off its equities
+that day); a wholly missing/empty `Varliklar` dict is treated as genuinely
+unknown and skips that day entirely -- same distinction documented in
+`fon_terminal/README.md`.
+
+## Shadow Portfolio engine, step 4: `resolve_multi_fund_deltas` (2026-07-30)
+
+Step 1 (`apply_delta`) leaves every multi-fund "Pay Alım Satım Bildirimi"
+disclosure `unresolved` -- KAP never breaks its aggregate TL figure down
+per fund.
+`KAPDeltaEngine.resolve_multi_fund_deltas(unresolved, tefas_power_matrix,
+updated_data)` estimates each fund's share of that aggregate using step
+3's Aktif Güç values, rather than leaving the data gap unfilled:
+
+1. **Timing:** uses the disclosure's own "İşlem Tarihi" (transaction date),
+   not its "Bildirim Tarihi" (publish date, which can trail the real trade
+   by days) -- see `INTERNAL_ARCHITECTURE.md`, item 12, for why this
+   distinction matters.
+2. **Pool:** sums every related fund's Aktif Güç on that transaction date
+   into a "Toplam Güç Havuzu".
+3. **Weight & estimate:** the target fund's weight is
+   `hedef_fonun_gücü / toplam_havuz`; the disclosure's aggregate
+   `net_nominal_tl` is multiplied by that weight to get an estimated lot
+   amount for the target fund alone.
+4. **Recording:** the estimate is added on top of `updated_data` (from
+   `apply_delta`'s single-fund `resolved` merge) and returned separately
+   as a `ProportionalResolution` list, so reporting code can clearly label
+   it as an ESTIMATE, never a KAP-confirmed figure.
+
+```python
+updated_data, proportionally_resolved = engine.resolve_multi_fund_deltas(
+    unresolved, tefas_power_matrix, updated_data
+)
+```
+
+**Never crashes, never guesses past a missing input:** if ANY related
+fund is missing TEFAS Aktif Güç data for that specific date, or the pool
+sums to zero/negative, that ONE transaction is skipped with a `[UYARI]`
+and left out of `updated_data` entirely -- silently assuming 0 for a
+missing fund would artificially inflate every other fund's share, so a
+transaction is either resolved with real data for every participant or
+not resolved at all.
+
+## Execution Trace: turning the pipeline into a readable story (2026-08-01)
+
+Every step above already prints extensively to the console, but that
+console log is a *technical* trace (one line per disclosure, per fund, per
+day) -- not something a non-technical reader opening
+`parser_kontrol_raporu.html` could follow. `kap_delta_engine._log_step`
+adds a second, parallel narrative log for exactly that audience: a short
+list of `{"time": "HH:MM:SS", "message": "..."}` entries appended at each
+critical milestone (KAP baseline fetched, disclosures scanned and
+classified, related funds discovered, TEFAS Aktif Güç calculated, the
+proportional-distribution formula applied, etc.), phrased as a step-by-step
+story rather than a raw dump.
+
+`KAPDeltaEngine.execution_logs` (an instance attribute, always a list --
+optionally seeded via the constructor's `execution_logs=` parameter so it
+can be a single object shared across the whole `__main__` run) is where
+its own methods (`apply_delta`, `discover_related_funds`,
+`resolve_multi_fund_deltas`) append to; `collect_global_baseline` and
+`build_tefas_power_matrix` accept the same shared list as an optional
+parameter for the same purpose. Passing `execution_logs=None` anywhere
+(the default) is a pure no-op -- every existing call site that doesn't
+care about this feature behaves exactly as it did before.
+
+`kap_pdf_parser._render_execution_log` renders the accumulated list as a
+terminal-styled (dark background, monospaced, vertical timeline line)
+block at the very TOP of `parser_kontrol_raporu.html` -- before the
+per-period grid and every delta section -- via `delta_report[
+"execution_logs"]`.
