@@ -1447,6 +1447,7 @@ if __name__ == "__main__":
         delta_report={
             "fon_kodu": FON_KODU,
             "baseline_period": latest_period,
+            "baseline_data": baseline_data,
             "resolved": resolved_plain,
             "unresolved": unresolved_plain,
             "proportionally_resolved": proportional_plain,

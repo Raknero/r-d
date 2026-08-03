@@ -210,12 +210,13 @@ Running `python kap_pdf_parser.py` now does both steps: prints the parsed
 holdings to the console, then writes `parser_kontrol_raporu.html` into the
 current directory for visual verification.
 
-**Optional delta sections (2026-07-28, extended through 2026-08-01):**
+**Optional delta sections (2026-07-28, extended through 2026-08-03):**
 `export_to_html` also accepts an optional `delta_report` dict (produced by
 `kap_delta_engine.py` -- see below), shaped as `{"fon_kodu",
-"baseline_period", "resolved", "unresolved", "proportionally_resolved",
-"updated_data", "tefas_power_matrix", "execution_logs"}`. When provided,
-the SAME `parser_kontrol_raporu.html` file gets extended with, in order:
+"baseline_period", "baseline_data", "resolved", "unresolved",
+"proportionally_resolved", "updated_data", "tefas_power_matrix",
+"execution_logs"}`. When provided, the SAME `parser_kontrol_raporu.html`
+file gets extended with, in order:
 
 1. **"Adım Adım Hesaplama ve Çalışma Günlüğü" (Execution Trace)** -- a
    terminal-styled vertical timeline placed at the very TOP of the report,
@@ -228,19 +229,62 @@ the SAME `parser_kontrol_raporu.html` file gets extended with, in order:
 4. **"Oransal Olarak Dağıtılan Çoklu Fon İşlemleri"** -- the subset of (3)
    that `resolve_multi_fund_deltas` was able to estimate proportionally
    (see Step 4 below).
-5. **"Güncel Portföy Son Durumu"** -- baseline + (2) + (4).
+5. **"Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)"** -- baseline + (2)
+   + (4), reshaped ticker-by-ticker with a % change and a click-to-expand
+   day-by-day transaction history (see its own section below).
 6. **"Günlük Aktif Satın Alma Gücü (TEFAS Havuzu)"** -- the raw
    `tefas_power_matrix` values that (4)'s weighting was based on, one row
    per date (most recent first), one column per fund.
 
 `delta_report=None` (the default) renders exactly the original per-period
 report with no extra sections; any individual key missing from
-`delta_report` (e.g. an older caller that predates `tefas_power_matrix` or
-`execution_logs`) just renders that one section as an explicit "veri
-bulunamadı" notice (or, for `execution_logs`, renders nothing at all)
-rather than breaking the rest of the report. This module still has zero
-import dependency on `kap_delta_engine.py` -- the caller passes plain
-dicts/lists, never the other module's dataclasses.
+`delta_report` (e.g. an older caller that predates `baseline_data`,
+`tefas_power_matrix`, or `execution_logs`) just renders that one section
+as an explicit "veri bulunamadı" notice (or, for `execution_logs`, renders
+nothing at all) rather than breaking the rest of the report. This module
+still has zero import dependency on `kap_delta_engine.py` -- the caller
+passes plain dicts/lists, never the other module's dataclasses.
+
+### "Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)": context over raw deltas (2026-08-03)
+
+A raw cumulative number like "PEKGY: -33.528.112,76 lot" (or the earlier
+"Güncel Portföy Son Durumu" section this replaces, which only showed the
+FINAL lot count) answers "what" but not "how much does that actually
+matter" or "did that happen in one shot or gradually" -- exactly the
+feedback that motivated this section. Each row now shows the FULL journey
+per ticker:
+
+| Sütun | Anlamı |
+|---|---|
+| Başlangıç Lot | `baseline_data[ticker]` -- KAP PDF baseline, 0 if the ticker didn't exist yet. |
+| Kesinleşen Delta Lot | Net (signed) sum of every single-fund `resolved` entry for this ticker. |
+| Oransal Tahmini Delta Lot | Net (signed) sum of every `proportionally_resolved` entry for this ticker. |
+| İşlem Tarihçesi | Click-to-expand `<details>` list of every INDIVIDUAL dated entry behind the two delta columns above (see below). |
+| Güncel Tahmini Lot | Başlangıç + Kesinleşen + Oransal. |
+| Lot Değişim Oranı (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, green if positive, red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). |
+
+Rows are sorted by the **absolute size** of the lot change (biggest movers
+first), not alphabetically -- with 20-40+ tickers per fund, an alphabetical
+listing buries the handful of rows anyone actually cares about under a
+wall of unchanged positions.
+
+**"İşlem Tarihçesi" column (2026-08-03):** the cumulative delta columns
+answer "how much changed", but a user correctly pointed out they don't
+answer "did that happen all at once, or gradually, and on which dates?" --
+a "-69 milyon lot" total could be one disclosure or ten. `kap_pdf_parser.
+_aggregate_signed_lot_deltas` now ALSO builds a per-ticker,
+chronologically-sorted (oldest first) list of every individual entry that
+fed into the cumulative total -- `{"date": "23/07/2026", "lot":
+42469924.0, "type": "Kesinleşen"}` -- and `_render_transaction_history_cell`
+renders it as a collapsed `<details>`/`<summary>` disclosure ("3 İşlem
+Göster") so the table stays scannable by default while the full
+day-by-day story (`[Tarih]: [İşaretli Lot] ([Tip])`, one `<li>` per entry)
+is one click away. A ticker with zero entries (e.g. one whose Kesinleşen
+AND Oransal deltas both happened to net to zero, or one that simply never
+appeared in any disclosure) renders a plain "İşlem Yok" instead of an
+empty, misleadingly-clickable disclosure. This is purely additive --
+expanding it never changes the cumulative Başlangıç/Kesinleşen/Oransal/
+Güncel/% figures next to it, which are computed exactly as before.
 
 ---
 

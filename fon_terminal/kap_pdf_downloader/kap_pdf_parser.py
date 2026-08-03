@@ -27,7 +27,7 @@ import html
 import os
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
 
@@ -316,6 +316,293 @@ def _format_tl_compact(value: float) -> str:
     return f"{_format_turkish_number(value)} TL"
 
 
+def _format_signed_number(value: float) -> str:
+    """Formats a lot delta with an explicit leading sign, e.g. 42469924.0
+    -> "+42.469.924,00", -12000000.0 -> "-12.000.000,00", 0.0 ->
+    "0,00" (no sign for an exact zero -- there's no meaningful direction
+    to show). Used for the "Kesinleşen Delta Lot" / "Oransal Tahmini Delta
+    Lot" columns of the portfolio evolution table, so a reader can tell a
+    buy from a sell at a glance without also reading a separate direction
+    column.
+    """
+    if value > 0:
+        return f"+{_format_turkish_number(value)}"
+    if value < 0:
+        return f"-{_format_turkish_number(abs(value))}"
+    return _format_turkish_number(0.0)
+
+
+def _format_pct_signed(value: float) -> str:
+    """Formats a percentage change with an explicit leading "+" for
+    positive values (negative values already carry their own "-" through
+    `_format_turkish_number`), e.g. 12.4532 -> "+12,45%", -8.3 ->
+    "-8,30%".
+    """
+    formatted = _format_turkish_number(value)
+    return f"+{formatted}%" if value > 0 else f"{formatted}%"
+
+
+def _date_sort_key(date_str: Optional[str]) -> Tuple[int, int, int]:
+    """Parses a "DD/MM/YYYY" (KAP's own separator) or "DD.MM.YYYY"
+    (this module's display separator, see `_format_display_date`) string
+    into a `(year, month, day)` tuple so transaction histories can be
+    sorted chronologically regardless of which separator the caller used.
+
+    Never raises: anything that isn't a clean 3-part date (missing,
+    malformed, non-numeric parts) sorts as `(0, 0, 0)` -- i.e. first,
+    never crashing the sort and never silently dropping the entry.
+    """
+    if not date_str:
+        return (0, 0, 0)
+    parts = re.split(r"[/.]", str(date_str).strip())
+    if len(parts) != 3:
+        return (0, 0, 0)
+    try:
+        day, month, year = parts
+        return (int(year), int(month), int(day))
+    except ValueError:
+        return (0, 0, 0)
+
+
+def _format_display_date(date_str: Optional[str]) -> str:
+    """Normalizes a "DD/MM/YYYY" date (KAP's own separator, as stored in
+    `resolved`/`proportionally_resolved` items) to "DD.MM.YYYY" for
+    display in the transaction-history list, matching this report's
+    other Turkish-formatted values. Passed through as-is (never raises)
+    if it doesn't look like a plain slash-separated date."""
+    return str(date_str or "").replace("/", ".")
+
+
+def _aggregate_signed_lot_deltas(
+    resolved: List[dict], proportional: List[dict]
+) -> "tuple[Dict[str, float], Dict[str, float], Dict[str, List[dict]]]":
+    """Reduces the "Kesinleşen Deltalar" (`resolved`) and "Oransal Olarak
+    Dağıtılan" (`proportional`) lists -- each potentially containing
+    several disclosures/dates for the SAME ticker -- into:
+
+    1. `resolved_by_ticker` / `proportional_by_ticker`: one signed,
+       per-ticker NET total for each, for the portfolio evolution table's
+       cumulative columns (unchanged behavior from before this function
+       also tracked history).
+    2. `transaction_history`: per-ticker, a chronologically-sorted
+       (oldest first) list of EVERY individual entry that fed into those
+       totals -- `{"date": "23/07/2026", "lot": 42469924.0, "type":
+       "Kesinleşen"}` -- so the report can show not just the net result
+       but the day-by-day story behind it (see `_render_portfolio_
+       evolution_table`'s "İşlem Tarihçesi" column).
+
+    `resolved` items store an UNSIGNED `lot` magnitude plus a separate
+    `direction` string (see `kap_delta_engine.ResolvedDelta`'s own
+    docstring for why), so the sign has to be reconstructed here:
+    "ALIM" -> +, "SATIM" -> -, anything else (e.g. "DEGISIM YOK") -> 0.
+    `proportional` items store an already-SIGNED `estimated_lot` (see
+    `kap_delta_engine.ProportionalResolution`) and are used as-is.
+
+    Never raises on a malformed entry -- a missing/non-numeric `lot` or
+    `estimated_lot`, or a ticker-less item, is simply skipped for that one
+    entry rather than aborting the whole aggregation.
+    """
+    resolved_by_ticker: Dict[str, float] = {}
+    transaction_history: Dict[str, List[dict]] = {}
+
+    for item in resolved or []:
+        ticker = str(item.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        try:
+            lot = float(item.get("lot") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        direction = item.get("direction")
+        signed_lot = lot if direction == "ALIM" else -lot if direction == "SATIM" else 0.0
+        resolved_by_ticker[ticker] = resolved_by_ticker.get(ticker, 0.0) + signed_lot
+        transaction_history.setdefault(ticker, []).append(
+            {"date": item.get("date"), "lot": signed_lot, "type": "Kesinleşen"}
+        )
+
+    proportional_by_ticker: Dict[str, float] = {}
+    for item in proportional or []:
+        ticker = str(item.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        try:
+            estimated_lot = float(item.get("estimated_lot") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        proportional_by_ticker[ticker] = proportional_by_ticker.get(ticker, 0.0) + estimated_lot
+        transaction_history.setdefault(ticker, []).append(
+            {"date": item.get("date"), "lot": estimated_lot, "type": "Oransal"}
+        )
+
+    for ticker_history in transaction_history.values():
+        ticker_history.sort(key=lambda entry: _date_sort_key(entry.get("date")))
+
+    return resolved_by_ticker, proportional_by_ticker, transaction_history
+
+
+def _render_transaction_history_cell(history: List[dict]) -> str:
+    """Renders one ticker's `transaction_history` entries (see
+    `_aggregate_signed_lot_deltas`) as a collapsed, click-to-expand
+    `<details>`/`<summary>` disclosure for the evolution table's "İşlem
+    Tarihçesi" column -- so the cumulative delta columns next to it stay
+    scannable while the full day-by-day story is still one click away,
+    never bloating the table by default.
+
+    Returns a plain "İşlem Yok" text (no `<details>` element at all) for
+    a ticker with an empty history -- e.g. `SELEC`, whose Kesinleşen AND
+    Oransal deltas both happened to be zero -- so there's nothing
+    misleadingly "expandable" with zero content inside.
+    """
+    if not history:
+        return '<span class="no-history">İşlem Yok</span>'
+
+    items_html = "".join(
+        f"""
+              <li>{html.escape(_format_display_date(entry.get('date')))}: """
+        f"""{html.escape(_format_signed_number(entry.get('lot') or 0.0))} """
+        f"""({html.escape(str(entry.get('type', '')))})</li>"""
+        for entry in history
+    )
+
+    count = len(history)
+    label = f"{count} İşlem Göster"
+    return f"""<details class="history-details">
+              <summary>{html.escape(label)}</summary>
+              <ul class="history-list">{items_html}
+              </ul>
+            </details>"""
+
+
+def _render_portfolio_evolution_table(
+    baseline_data: Dict[str, float],
+    resolved: List[dict],
+    proportional: List[dict],
+    updated_data: Dict[str, float],
+) -> str:
+    """Renders the "Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)" table:
+    one row per ticker showing its FULL journey from the KAP PDF baseline
+    to the current estimated holding -- Başlangıç Lot, Kesinleşen Delta
+    Lot (net, signed), Oransal Tahmini Delta Lot (net, signed), Güncel
+    Tahmini Lot, and a Lot Değişim Oranı (%) that puts every other column
+    into context (a "-69 milyon lot" delta means nothing on its own; "-69
+    milyon lot, başlangıcın %35'i" does).
+
+    `Güncel Tahmini Lot` is computed directly as `Başlangıç + Kesinleşen +
+    Oransal` (not read from `updated_data`) so the table is internally
+    self-consistent and the formula is transparent; in practice this
+    always matches `updated_data[ticker]` since that's exactly how
+    `apply_delta`/`resolve_multi_fund_deltas` built it. `updated_data` is
+    still accepted as a parameter so a ticker that ended up there through
+    some other path (defensive) is never silently dropped from this table.
+
+    A ticker absent from `baseline_data` (Başlangıç Lot == 0) is a
+    genuinely different case from a small existing position shrinking to
+    near-zero -- computing a percentage against a zero baseline is
+    mathematically meaningless (division by zero), not just a rounding
+    edge case. Rendered as "YENİ HİSSE" instead of a percentage when its
+    current estimated lot is non-zero, or a plain "-" if it nets out to
+    exactly zero (i.e. it was only ever mentioned in disclosures that
+    canceled out, never a real new position).
+
+    Rows are sorted by the ABSOLUTE size of the lot change (largest movers
+    first), not alphabetically -- the whole point of this table is
+    answering "hangi hisse ne kadar değişmiş" at a glance, and an
+    alphabetical listing buries that under 200 unchanged/near-zero rows.
+
+    Between "Oransal Tahmini Delta Lot" and "Güncel Tahmini Lot" sits an
+    "İşlem Tarihçesi" column (see `_render_transaction_history_cell`): a
+    collapsed `<details>`/`<summary>` disclosure ("3 İşlem Göster") that,
+    when clicked, lists every individual dated entry (both Kesinleşen and
+    Oransal) behind that ticker's cumulative delta, oldest first -- so a
+    "-69 milyon lot" total is never presented as if it happened all at
+    once when it was really, say, four separate transactions spread
+    across three weeks. This is PURELY additive: it never changes the
+    cumulative Başlangıç/Kesinleşen/Oransal/Güncel/% figures, which are
+    computed exactly as before.
+
+    Never raises: returns an explicit "veri bulunamadı" notice if there is
+    nothing at all to compare (empty baseline AND no deltas of any kind).
+    """
+    resolved_by_ticker, proportional_by_ticker, transaction_history = _aggregate_signed_lot_deltas(
+        resolved, proportional
+    )
+
+    all_tickers = set(baseline_data) | set(updated_data) | set(resolved_by_ticker) | set(proportional_by_ticker)
+    if not all_tickers:
+        return '<p class="empty-notice">Portföy evrimi için karşılaştırılabilir veri bulunamadı.</p>'
+
+    rows = []
+    for ticker in all_tickers:
+        baseline_lot = baseline_data.get(ticker, 0.0)
+        resolved_delta = resolved_by_ticker.get(ticker, 0.0)
+        proportional_delta = proportional_by_ticker.get(ticker, 0.0)
+        current_lot = baseline_lot + resolved_delta + proportional_delta
+        rows.append((ticker, baseline_lot, resolved_delta, proportional_delta, current_lot))
+
+    rows.sort(key=lambda r: abs(r[4] - r[1]), reverse=True)
+
+    body_rows: List[str] = []
+    total_baseline = total_resolved = total_proportional = total_current = 0.0
+    for ticker, baseline_lot, resolved_delta, proportional_delta, current_lot in rows:
+        total_baseline += baseline_lot
+        total_resolved += resolved_delta
+        total_proportional += proportional_delta
+        total_current += current_lot
+
+        if baseline_lot == 0:
+            if current_lot == 0:
+                pct_cell = '<td class="num pct-neutral">-</td>'
+            else:
+                pct_cell = '<td class="num pct-new">YENİ HİSSE</td>'
+        else:
+            pct = ((current_lot - baseline_lot) / baseline_lot) * 100.0
+            pct_class = "pct-up" if pct > 0 else "pct-down" if pct < 0 else "pct-neutral"
+            pct_cell = f'<td class="num {pct_class}">{html.escape(_format_pct_signed(pct))}</td>'
+
+        history_cell = _render_transaction_history_cell(transaction_history.get(ticker) or [])
+
+        body_rows.append(
+            f"""
+              <tr>
+                <td>{html.escape(ticker)}</td>
+                <td class="num">{html.escape(_format_turkish_number(baseline_lot))}</td>
+                <td class="num">{html.escape(_format_signed_number(resolved_delta))}</td>
+                <td class="num">{html.escape(_format_signed_number(proportional_delta))}</td>
+                <td class="history-cell">{history_cell}</td>
+                <td class="num">{html.escape(_format_turkish_number(current_lot))}</td>
+                {pct_cell}
+              </tr>"""
+        )
+
+    return f"""
+          <table>
+            <thead>
+              <tr>
+                <th>Hisse Kodu</th>
+                <th class="num">Başlangıç Lot</th>
+                <th class="num">Kesinleşen Delta Lot</th>
+                <th class="num">Oransal Tahmini Delta Lot</th>
+                <th>İşlem Tarihçesi</th>
+                <th class="num">Güncel Tahmini Lot</th>
+                <th class="num">Lot Değişim Oranı (%)</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(body_rows)}
+            </tbody>
+            <tfoot>
+              <tr>
+                <td>TOPLAM</td>
+                <td class="num">{html.escape(_format_turkish_number(total_baseline))}</td>
+                <td class="num">{html.escape(_format_signed_number(total_resolved))}</td>
+                <td class="num">{html.escape(_format_signed_number(total_proportional))}</td>
+                <td>-</td>
+                <td class="num">{html.escape(_format_turkish_number(total_current))}</td>
+                <td class="num">-</td>
+              </tr>
+            </tfoot>
+          </table>"""
+
+
 def _render_tefas_power_table(tefas_power_matrix: Dict[str, Dict[str, float]], fon_kodu: str = "") -> str:
     """Renders `kap_delta_engine.build_tefas_power_matrix`'s output
     (`{"TLY": {"2026-07-31": 191393702793.58, ...}, "DOH": {...}, ...}`) as
@@ -370,30 +657,6 @@ def _render_tefas_power_table(tefas_power_matrix: Dict[str, Dict[str, float]], f
       </div>"""
 
 
-def _holdings_table_html(holdings: Dict[str, float], code_header: str = "Hisse/Varlık Kodu") -> str:
-    """Shared renderer for a simple {kod: lot} table with a TOPLAM footer
-    row, used both by the per-period cards above and by the "Güncel
-    Portföy Son Durumu" delta section below."""
-    if not holdings:
-        return '<p class="empty-notice">Veri bulunamadı.</p>'
-    rows = "".join(
-        f"""
-              <tr>
-                <td>{html.escape(str(ticker))}</td>
-                <td class="num">{html.escape(_format_turkish_number(holdings[ticker]))}</td>
-              </tr>"""
-        for ticker in sorted(holdings)
-    )
-    total = sum(holdings.values())
-    return f"""
-          <table>
-            <thead><tr><th>{html.escape(code_header)}</th><th class="num">Nominal Değer (Lot)</th></tr></thead>
-            <tbody>{rows}
-            </tbody>
-            <tfoot><tr><td>TOPLAM</td><td class="num">{html.escape(_format_turkish_number(total))}</td></tr></tfoot>
-          </table>"""
-
-
 def _render_execution_log(execution_logs: Optional[List[Dict[str, str]]]) -> str:
     """Renders `kap_delta_engine`'s step-by-step narrative log (see that
     module's `_log_step` helper -- a list of `{"time": "HH:MM:SS",
@@ -439,15 +702,18 @@ def _render_delta_sections(delta_report: dict) -> str:
     (`export_to_html`'s `delta_report` argument) as extra full-width
     `.period-card`-styled sections: Kesinlesen Deltalar, Cozulemeyen/Coklu
     Fon Bildirimleri, Oransal Olarak Dagitilan Coklu Fon Islemleri (from
-    `resolve_multi_fund_deltas`, optional), Guncel Portfoy Son Durumu, and
-    Gunluk Aktif Satin Alma Gucu (TEFAS Havuzu) (from
-    `build_tefas_power_matrix`, optional -- see `_render_tefas_power_table`).
-    Never raises: missing/empty lists (or a missing `tefas_power_matrix`)
+    `resolve_multi_fund_deltas`, optional), Hisse Bazli Portfoy Evrimi
+    (Lot Degisim Ozeti) -- baseline'dan bugune ticker basina net degisim
+    ve % oran, bkz. `_render_portfolio_evolution_table` --, and Gunluk
+    Aktif Satin Alma Gucu (TEFAS Havuzu) (from `build_tefas_power_matrix`,
+    optional -- see `_render_tefas_power_table`). Never raises:
+    missing/empty lists (or a missing `tefas_power_matrix`/`baseline_data`)
     are rendered as an explicit "veri bulunamadi" notice rather than a
     broken table.
     """
     fon_kodu = delta_report.get("fon_kodu") or ""
     baseline_period = delta_report.get("baseline_period") or "?"
+    baseline_data = delta_report.get("baseline_data") or {}
     resolved = delta_report.get("resolved") or []
     unresolved = delta_report.get("unresolved") or []
     proportional = delta_report.get("proportionally_resolved") or []
@@ -524,6 +790,7 @@ def _render_delta_sections(delta_report: dict) -> str:
     else:
         proportional_html = '<p class="empty-notice">Oransal olarak dağıtılmış bir işlem bulunamadı.</p>'
 
+    evolution_html = _render_portfolio_evolution_table(baseline_data, resolved, proportional, updated_data)
     tefas_power_html = _render_tefas_power_table(tefas_power_matrix, fon_kodu)
     tefas_power_days = len({date_str for daily in tefas_power_matrix.values() for date_str in daily})
 
@@ -545,9 +812,9 @@ def _render_delta_sections(delta_report: dict) -> str:
       {proportional_html}
     </section>
     <section class="period-card">
-      <h2>Güncel Portföy Son Durumu <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü + Kesinleşen Deltalar + Oransal Olarak Dağıtılan Tahmini Deltalar.</p>
-      {_holdings_table_html(updated_data, code_header="Hisse/Pay Kodu")}
+      <h2>Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti) <span class="badge">{len(updated_data)} kod</span></h2>
+      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Lot Değişim Oranı", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. En büyük değişim gösteren hisseler üstte listelenir.</p>
+      {evolution_html}
     </section>
     <section class="period-card">
       <h2>Günlük Aktif Satın Alma Gücü (TEFAS Havuzu) <span class="badge">{len(tefas_power_matrix)} fon &middot; {tefas_power_days} gün</span></h2>
@@ -574,18 +841,19 @@ def export_to_html(
     `kap_delta_engine.KAPDeltaEngine.apply_delta` (see that module for how
     they're computed): five extra sections (Kesinlesen Deltalar,
     Cozulemeyen/Coklu Fon Bildirimleri, Oransal Olarak Dagitilan Coklu Fon
-    Islemleri, Guncel Portfoy Son Durumu, and Gunluk Aktif Satin Alma Gucu)
-    appended AFTER the per-period grid above, plus one more -- the "Adim
-    Adim Hesaplama ve Calisma Gunlugu" (Execution Trace) timeline -- placed
-    BEFORE everything else (even before the per-period grid), so a reader
-    sees the pipeline's full plain-language reasoning first and the raw
-    tables second. This module has no import dependency on
-    `kap_delta_engine.py` itself, so the caller passes plain dicts/lists,
-    shaped as:
+    Islemleri, Hisse Bazli Portfoy Evrimi/Lot Degisim Ozeti, and Gunluk
+    Aktif Satin Alma Gucu) appended AFTER the per-period grid above, plus
+    one more -- the "Adim Adim Hesaplama ve Calisma Gunlugu" (Execution
+    Trace) timeline -- placed BEFORE everything else (even before the
+    per-period grid), so a reader sees the pipeline's full plain-language
+    reasoning first and the raw tables second. This module has no import
+    dependency on `kap_delta_engine.py` itself, so the caller passes plain
+    dicts/lists, shaped as:
 
         {
             "fon_kodu": "TLY",
             "baseline_period": "2026_03",             # which parsed_data key was used as the delta baseline
+            "baseline_data": {"ALKLC": 731256.0, ...},  # that period's raw holdings -- the "Başlangıç Lot" column
             "resolved": [                               # single-fund, applied deltas
                 {"date": "23/07/2026", "ticker": "BIGEN", "lot": 42469924.0, "direction": "ALIM"},
                 ...
@@ -612,6 +880,13 @@ def export_to_html(
                 ...
             ],
         }
+
+    Omitting `baseline_data` (older callers that predate this field) is
+    handled gracefully: every ticker's "Başlangıç Lot" simply renders as 0
+    and, since 0 vs. a non-zero current lot is exactly the "YENİ HİSSE"
+    case (see `_render_portfolio_evolution_table`), every row would render
+    as a new position -- technically correct given the missing input, but
+    a strong signal to pass this field if it's available.
 
     Pass `delta_report=None` (the default) to render exactly the original
     per-period report with no extra sections -- fully backward compatible.
@@ -815,6 +1090,72 @@ def export_to_html(
   }}
   .dir-alim {{ color: #065f46; font-weight: 600; }}
   .dir-satim {{ color: #991b1b; font-weight: 600; }}
+  .pct-up {{ color: #065f46; font-weight: 700; }}
+  .pct-down {{ color: #991b1b; font-weight: 700; }}
+  .pct-neutral {{ color: #9ca3af; }}
+  .pct-new {{
+    color: #1d4ed8;
+    font-weight: 700;
+    background: #dbeafe;
+    border-radius: 6px;
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+  }}
+  td.history-cell {{
+    white-space: nowrap;
+  }}
+  .no-history {{
+    color: #9ca3af;
+    font-style: italic;
+    font-size: 12px;
+  }}
+  .history-details {{
+    display: inline-block;
+  }}
+  .history-details summary {{
+    cursor: pointer;
+    color: #1d4ed8;
+    font-size: 12px;
+    font-weight: 600;
+    list-style: none;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: #eff6ff;
+    border: 1px solid #dbeafe;
+    white-space: nowrap;
+  }}
+  .history-details summary::-webkit-details-marker {{
+    display: none;
+  }}
+  .history-details summary:hover {{
+    background: #dbeafe;
+  }}
+  .history-details[open] summary {{
+    background: #dbeafe;
+    border-radius: 8px 8px 0 0;
+  }}
+  .history-list {{
+    list-style: none;
+    margin: 0;
+    padding: 8px 10px;
+    background: #f8fafc;
+    border: 1px solid #dbeafe;
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    min-width: 220px;
+    max-width: 320px;
+    white-space: normal;
+  }}
+  .history-list li {{
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 12px;
+    color: #374151;
+    padding: 3px 0;
+    border-bottom: 1px dashed #e5e7eb;
+  }}
+  .history-list li:last-child {{
+    border-bottom: none;
+  }}
   .table-scroll {{
     overflow-x: auto;
   }}
