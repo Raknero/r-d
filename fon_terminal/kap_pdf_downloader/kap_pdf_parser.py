@@ -478,6 +478,8 @@ def _render_portfolio_evolution_table(
     resolved: List[dict],
     proportional: List[dict],
     updated_data: Dict[str, float],
+    current_prices: Optional[Dict[str, float]] = None,
+    current_aum: Optional[float] = None,
 ) -> str:
     """Renders the "Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)" table:
     one row per ticker showing its FULL journey from the KAP PDF baseline
@@ -504,11 +506,6 @@ def _render_portfolio_evolution_table(
     exactly zero (i.e. it was only ever mentioned in disclosures that
     canceled out, never a real new position).
 
-    Rows are sorted by the ABSOLUTE size of the lot change (largest movers
-    first), not alphabetically -- the whole point of this table is
-    answering "hangi hisse ne kadar değişmiş" at a glance, and an
-    alphabetical listing buries that under 200 unchanged/near-zero rows.
-
     Between "Oransal Tahmini Delta Lot" and "Güncel Tahmini Lot" sits an
     "İşlem Tarihçesi" column (see `_render_transaction_history_cell`): a
     collapsed `<details>`/`<summary>` disclosure ("3 İşlem Göster") that,
@@ -520,12 +517,33 @@ def _render_portfolio_evolution_table(
     cumulative Başlangıç/Kesinleşen/Oransal/Güncel/% figures, which are
     computed exactly as before.
 
+    Two more columns follow "Lot Değişim Oranı (%)": "Güncel Fiyat (TL)"
+    (from `current_prices`, see `kap_delta_engine.fetch_bist_prices`) and
+    "Güncel Ağırlık (%)" -- `(Güncel Tahmini Lot * Güncel Fiyat /
+    current_aum) * 100`, i.e. what fraction of the fund's TOTAL AUM
+    (`current_aum`, the raw ToplamDeger, not the "Aktif Güç" subset) this
+    single position currently represents. A ticker with no live price
+    (missing/delisted/not yet IPO'd -- see `fetch_bist_prices`'s own
+    "never fabricates" contract) or a missing/zero `current_aum` renders
+    both cells as a plain "-": the weight calculation is skipped for that
+    row entirely, never guessed at with a 0.
+
+    Rows are sorted PRIMARILY by "Güncel Ağırlık (%)" descending (rows
+    with a known weight always sort above rows without one) -- this
+    table's main question shifted from "hangi hisse ne kadar değişmiş"
+    to "portföyün en büyük pozisyonu ne?" once a real TL weight became
+    computable. Rows without a resolvable weight (no live price, or no
+    AUM at all) fall back to the ABSOLUTE size of the lot change as a
+    secondary sort, so they're still roughly biggest-mover-first among
+    themselves rather than in arbitrary dict-iteration order.
+
     Never raises: returns an explicit "veri bulunamadı" notice if there is
     nothing at all to compare (empty baseline AND no deltas of any kind).
     """
     resolved_by_ticker, proportional_by_ticker, transaction_history = _aggregate_signed_lot_deltas(
         resolved, proportional
     )
+    current_prices = current_prices or {}
 
     all_tickers = set(baseline_data) | set(updated_data) | set(resolved_by_ticker) | set(proportional_by_ticker)
     if not all_tickers:
@@ -537,13 +555,30 @@ def _render_portfolio_evolution_table(
         resolved_delta = resolved_by_ticker.get(ticker, 0.0)
         proportional_delta = proportional_by_ticker.get(ticker, 0.0)
         current_lot = baseline_lot + resolved_delta + proportional_delta
-        rows.append((ticker, baseline_lot, resolved_delta, proportional_delta, current_lot))
 
-    rows.sort(key=lambda r: abs(r[4] - r[1]), reverse=True)
+        price = current_prices.get(ticker)
+        weight_pct: Optional[float] = None
+        if price is not None and current_aum:
+            try:
+                position_size = current_lot * float(price)
+                weight_pct = (position_size / current_aum) * 100.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                weight_pct = None
+
+        rows.append((ticker, baseline_lot, resolved_delta, proportional_delta, current_lot, price, weight_pct))
+
+    rows.sort(
+        key=lambda r: (
+            r[6] is not None,
+            r[6] if r[6] is not None else 0.0,
+            abs(r[4] - r[1]),
+        ),
+        reverse=True,
+    )
 
     body_rows: List[str] = []
-    total_baseline = total_resolved = total_proportional = total_current = 0.0
-    for ticker, baseline_lot, resolved_delta, proportional_delta, current_lot in rows:
+    total_baseline = total_resolved = total_proportional = total_current = total_position_size = 0.0
+    for ticker, baseline_lot, resolved_delta, proportional_delta, current_lot, price, weight_pct in rows:
         total_baseline += baseline_lot
         total_resolved += resolved_delta
         total_proportional += proportional_delta
@@ -561,6 +596,17 @@ def _render_portfolio_evolution_table(
 
         history_cell = _render_transaction_history_cell(transaction_history.get(ticker) or [])
 
+        if price is None:
+            price_cell = '<td class="num pct-neutral">-</td>'
+        else:
+            price_cell = f'<td class="num">{html.escape(_format_turkish_number(price))}</td>'
+
+        if weight_pct is None:
+            weight_cell = '<td class="num pct-neutral">-</td>'
+        else:
+            total_position_size += current_lot * price
+            weight_cell = f'<td class="num">{html.escape(_format_turkish_number(weight_pct))}%</td>'
+
         body_rows.append(
             f"""
               <tr>
@@ -571,11 +617,20 @@ def _render_portfolio_evolution_table(
                 <td class="history-cell">{history_cell}</td>
                 <td class="num">{html.escape(_format_turkish_number(current_lot))}</td>
                 {pct_cell}
+                {price_cell}
+                {weight_cell}
               </tr>"""
         )
 
+    total_weight_cell = (
+        f'<td class="num">{html.escape(_format_turkish_number((total_position_size / current_aum) * 100.0))}%</td>'
+        if current_aum
+        else '<td class="num">-</td>'
+    )
+
     return f"""
-          <table>
+      <div class="table-scroll">
+      <table>
             <thead>
               <tr>
                 <th>Hisse Kodu</th>
@@ -585,6 +640,8 @@ def _render_portfolio_evolution_table(
                 <th>İşlem Tarihçesi</th>
                 <th class="num">Güncel Tahmini Lot</th>
                 <th class="num">Lot Değişim Oranı (%)</th>
+                <th class="num">Güncel Fiyat (TL)</th>
+                <th class="num">Güncel Ağırlık (%)</th>
               </tr>
             </thead>
             <tbody>{''.join(body_rows)}
@@ -598,9 +655,12 @@ def _render_portfolio_evolution_table(
                 <td>-</td>
                 <td class="num">{html.escape(_format_turkish_number(total_current))}</td>
                 <td class="num">-</td>
+                <td class="num">-</td>
+                {total_weight_cell}
               </tr>
             </tfoot>
-          </table>"""
+      </table>
+      </div>"""
 
 
 def _render_tefas_power_table(tefas_power_matrix: Dict[str, Dict[str, float]], fon_kodu: str = "") -> str:
@@ -703,13 +763,17 @@ def _render_delta_sections(delta_report: dict) -> str:
     `.period-card`-styled sections: Kesinlesen Deltalar, Cozulemeyen/Coklu
     Fon Bildirimleri, Oransal Olarak Dagitilan Coklu Fon Islemleri (from
     `resolve_multi_fund_deltas`, optional), Hisse Bazli Portfoy Evrimi
-    (Lot Degisim Ozeti) -- baseline'dan bugune ticker basina net degisim
-    ve % oran, bkz. `_render_portfolio_evolution_table` --, and Gunluk
-    Aktif Satin Alma Gucu (TEFAS Havuzu) (from `build_tefas_power_matrix`,
-    optional -- see `_render_tefas_power_table`). Never raises:
-    missing/empty lists (or a missing `tefas_power_matrix`/`baseline_data`)
-    are rendered as an explicit "veri bulunamadi" notice rather than a
-    broken table.
+    (Lot Degisim Ozeti) -- baseline'dan bugune ticker basina net degisim,
+    % oran, guncel BIST fiyati (`current_prices`, see
+    `kap_delta_engine.fetch_bist_prices`) ve fonun toplam AUM'una
+    (`current_aum`, see `kap_delta_engine.get_latest_aum_for_fund`) oranla
+    guncel agirlik (%) -- bkz. `_render_portfolio_evolution_table` --, and
+    Gunluk Aktif Satin Alma Gucu (TEFAS Havuzu) (from
+    `build_tefas_power_matrix`, optional -- see `_render_tefas_power_table`).
+    Never raises: missing/empty lists (or a missing
+    `tefas_power_matrix`/`baseline_data`/`current_prices`/`current_aum`)
+    are rendered as an explicit "veri bulunamadi" notice (or a plain "-"
+    per-cell) rather than a broken table.
     """
     fon_kodu = delta_report.get("fon_kodu") or ""
     baseline_period = delta_report.get("baseline_period") or "?"
@@ -719,6 +783,9 @@ def _render_delta_sections(delta_report: dict) -> str:
     proportional = delta_report.get("proportionally_resolved") or []
     updated_data = delta_report.get("updated_data") or {}
     tefas_power_matrix = delta_report.get("tefas_power_matrix") or {}
+    current_prices = delta_report.get("current_prices") or {}
+    current_aum = delta_report.get("current_aum")
+    current_aum_date = delta_report.get("current_aum_date")
 
     if resolved:
         resolved_rows = "".join(
@@ -790,7 +857,14 @@ def _render_delta_sections(delta_report: dict) -> str:
     else:
         proportional_html = '<p class="empty-notice">Oransal olarak dağıtılmış bir işlem bulunamadı.</p>'
 
-    evolution_html = _render_portfolio_evolution_table(baseline_data, resolved, proportional, updated_data)
+    evolution_html = _render_portfolio_evolution_table(
+        baseline_data, resolved, proportional, updated_data, current_prices, current_aum
+    )
+    aum_note = (
+        f'{html.escape(_format_turkish_number(current_aum))} TL toplam AUM ({html.escape(str(current_aum_date))} tarihli TEFAS verisi) baz alınmıştır.'
+        if current_aum
+        else "güncel Toplam AUM bulunamadığı için bu sütun \"-\" olarak bırakılmıştır."
+    )
     tefas_power_html = _render_tefas_power_table(tefas_power_matrix, fon_kodu)
     tefas_power_days = len({date_str for daily in tefas_power_matrix.values() for date_str in daily})
 
@@ -813,7 +887,7 @@ def _render_delta_sections(delta_report: dict) -> str:
     </section>
     <section class="period-card">
       <h2>Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti) <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Lot Değişim Oranı", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. En büyük değişim gösteren hisseler üstte listelenir.</p>
+      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Lot Değişim Oranı", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo artık "portföyün en büyük pozisyonu ne?" sorusuna göre, Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
       {evolution_html}
     </section>
     <section class="period-card">
@@ -874,6 +948,13 @@ def export_to_html(
                 "DOH": {"2026-07-31": 449426747.01, ...},
                 ...
             },
+            "current_prices": {                          # optional -- kap_delta_engine.fetch_bist_prices()
+                "ALKLC": 48.25, "BIGEN": 12.7,
+                "SELEC": None,                            # delisted/no price found -> None, never 0.0
+                ...
+            },
+            "current_aum": 191393702793.58,              # optional -- kap_delta_engine.get_latest_aum_for_fund()[1]
+            "current_aum_date": "2026-07-31",             # optional -- kap_delta_engine.get_latest_aum_for_fund()[0]
             "execution_logs": [                          # optional -- see kap_delta_engine._log_step
                 {"time": "12:03:41", "message": "Adım 0 (Başlangıç Portföyü): ..."},
                 {"time": "12:03:58", "message": "Adım 1 tamamlandı: ..."},

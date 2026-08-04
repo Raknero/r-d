@@ -6,3 +6,13 @@ beautifulsoup4==4.13.4
 # bridges to fon_terminal/data_scraper.py (one directory up) to reuse its
 # existing TEFAS scraper -- pinned to match fon_terminal/requirements.txt.
 playwright==1.61.0
+
+# Only required for kap_delta_engine.py's fetch_bist_prices(), which pulls
+# live BIST closing prices (via the ".IS" Yahoo Finance suffix) to turn the
+# portfolio evolution table's lot counts into a TL position size / AUM %.
+yfinance==1.5.2
+
+# Wraps every outbound KAP HTTP call (kap_downloader.py's
+# _request_with_retry, reused by kap_delta_engine.py) with an exponential
+# backoff retry ONLY on HTTP 429/50x -- see both modules' own docstrings.
+tenacity==9.1.4

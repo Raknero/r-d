@@ -42,48 +42,78 @@ IMPORTANT / UNRESOLVED DATA LIMITATION (verified live, not assumed):
     guessing here would silently corrupt financial data.
 
 Usage:
-    from kap_delta_engine import KAPDeltaEngine
+    from kap_delta_engine import KAPDeltaEngine, baseline_period_to_delta_start
+    from datetime import date
 
-    baseline = {"SVGYO": 10000.0}  # from KAPPdfParser.parse_file(...)
+    baseline = {"SVGYO": 10000.0}  # from KAPPdfParser.parse_file(...) for 2026/06
+    start = baseline_period_to_delta_start(2026, 6)  # -> 2026-07-01 (day AFTER PDF month ends)
     with KAPDeltaEngine(fon_kodu="TLY") as engine:
-        updated, unresolved = engine.apply_delta(baseline, start_date="2026-06-01", end_date="2026-07-28")
+        updated, resolved, unresolved = engine.apply_delta(
+            baseline, start_date=start.isoformat(), end_date=date.today().isoformat()
+        )
 """
 
 from __future__ import annotations
 
+import calendar
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from html import escape as html_escape
 from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
-from kap_downloader import KAPPdfDownloader
+from kap_downloader import KAPPdfDownloader, _request_with_retry
 from kap_pdf_parser import KAPPdfParser
 
 
+def baseline_period_end_date(year: int, donem: int) -> date:
+    """Last calendar day of a monthly KAP PDF baseline period
+    (e.g. 2026/07 -> 2026-07-31), via `calendar.monthrange`."""
+    last_day = calendar.monthrange(year, donem)[1]
+    return date(year, donem, last_day)
+
+
+def baseline_period_to_delta_start(year: int, donem: int) -> date:
+    """Returns the first calendar day AFTER a monthly KAP PDF baseline
+    period ends -- the earliest date whose buy/sell disclosures may be
+    layered on top of that PDF without double-counting.
+
+    A "Portföy Dağılım Raporu" for period `(year, donem)` (e.g. 2026/07)
+    already reflects the fund's holdings as of the LAST day of that month
+    (31.07.2026). Applying any intra-month trade whose İşlem Tarihi falls
+    on or before that last day would re-apply lots the PDF already
+    contains. So the delta window must open on day `last_day + 1`
+    (01.08.2026 here), computed via `calendar.monthrange` so Feb/30-day
+    months are handled correctly rather than hard-coding day 31.
+    """
+    return baseline_period_end_date(year, donem) + timedelta(days=1)
+
+
+def _format_tr_date(value: date) -> str:
+    """Formats a `date` as DD.MM.YYYY for audit-trail log lines."""
+    return value.strftime("%d.%m.%Y")
+
+
+def _format_tr_number(value: float, decimals: int = 2) -> str:
+    """Turkish thousands/decimal separators for audit-trail numbers."""
+    us = f"{value:,.{decimals}f}"
+    return us.replace(",", "\u0001").replace(".", ",").replace("\u0001", ".")
+
+
 def _log_step(execution_logs: Optional[List[Dict[str, str]]], message: str) -> None:
-    """Appends one human-readable narrative entry to `execution_logs`, for
-    the "Adim Adim Hesaplama ve Calisma Gunlugu" (Execution Trace) section
-    `kap_pdf_parser._render_execution_log` renders at the top of
-    `parser_kontrol_raporu.html`.
+    """Appends one mechanical audit-trail entry to `execution_logs` for the
+    HTML "Adım Adım Hesaplama ve Çalışma Günlüğü" section.
 
-    This is DELIBERATELY separate from the module's existing `print(...)`
-    calls (which stay exactly as they were -- see every call site): the
-    console output is a detailed, per-disclosure/per-fund technical trace,
-    while `execution_logs` is a short, story-like narrative meant for a
-    non-technical reader to follow the pipeline's REASONING end to end
-    ("KAP'ta N bildirim bulundu, bunlardan X'i tek-fonlu oldugu icin
-    uygulandi, Y'si coklu fon oldugu icin ayri siniflandirildi", etc.),
-    without wading through every individual disclosure/day log line.
+    Prefer concrete evidence (PDF filename, Belge No / disclosureIndex,
+    ISO date windows, formula inputs/outputs) over PR-style summaries.
+    Console `print(...)` stays the noisy technical stream; this list is
+    the durable, parameter-level trail rendered in the HTML report.
 
-    Never raises and is a pure no-op if `execution_logs` is None -- every
-    call site that doesn't care about logging (or is invoked without a
-    shared list) behaves EXACTLY as before this feature was added; nothing
-    about the existing data pipeline changes because of this function.
+    Never raises; no-op if `execution_logs` is None.
     """
     if execution_logs is None:
         return
@@ -308,8 +338,9 @@ class KAPDeltaEngine:
         }
 
         try:
-            response = self.session.post(url, json=body, timeout=self.timeout)
-            response.raise_for_status()
+            response = _request_with_retry(
+                self.session, "POST", url, json=body, timeout=self.timeout, execution_logs=self.execution_logs
+            )
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] [{self.fon_kodu}] Bildirim listesi alinamadi: {exc}")
             return []
@@ -363,10 +394,14 @@ class KAPDeltaEngine:
         """
         url = self.BASE_URL + self.DETAIL_PAGE.format(disclosure_index=disclosure_index)
         try:
-            response = self.session.get(
-                url, timeout=self.timeout, headers={"Accept": "text/html,application/xhtml+xml"}
+            response = _request_with_retry(
+                self.session,
+                "GET",
+                url,
+                timeout=self.timeout,
+                headers={"Accept": "text/html,application/xhtml+xml"},
+                execution_logs=self.execution_logs,
             )
-            response.raise_for_status()
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] [{self.fon_kodu}] Detay sayfasi alinamadi (disclosureIndex={disclosure_index}): {exc}")
             return []
@@ -558,10 +593,11 @@ class KAPDeltaEngine:
         other_funds = [code for code in discovered if code != self.fon_kodu]
         _log_step(
             self.execution_logs,
-            f"Adım 2 (Keşif): Çözülemeyen {len(unresolved)} çoklu-fon bildiriminin 'İlgili Fonlar' "
-            f"listeleri tarandı; {self.fon_kodu} ile aynı portföy yönetim şirketine bağlı "
-            f"{len(other_funds)} 'kardeş' fon tespit edildi: {', '.join(other_funds) or 'yok'}. "
-            "Bu fonların her biri için ayrı bir KAP baseline'ı ve TEFAS verisi toplanacak.",
+            f"Keşif (discover_related_funds): {len(unresolved)} unresolved bildirimin "
+            f"'İlgili Fonlar' alanları tarandı. Hedef={self.fon_kodu}. "
+            f"Benzersiz fon kodları={discovered}. "
+            f"Kardeş fon sayısı={len(other_funds)} ({', '.join(other_funds) or 'yok'}). "
+            "Bu dizi global baseline + TEFAS güç matrisi girdilerine aktarılacak.",
         )
         return discovered
 
@@ -612,25 +648,55 @@ class KAPDeltaEngine:
            one fund, in full, UNAPPLIED. See the "UNRESOLVED DATA
            LIMITATION" note in the module docstring for why these are
            deliberately not merged into `updated_data`.
+
+        Double-counting guard: KAP's `byCriteria` endpoint filters by
+        *publish* date (`fromDate`/`toDate`), not by the disclosure's
+        own İşlem Tarihi. A notice published after `start_date` can still
+        carry a transaction date that falls inside the baseline PDF
+        month (already baked into that PDF). Any parsed row whose
+        İşlem Tarihi is strictly before `start_date` is therefore
+        skipped -- never applied to baseline, never added to
+        `resolved`/`unresolved` -- so the monthly PDF and the daily
+        deltas never overlap. Callers should set `start_date` via
+        `baseline_period_to_delta_start(year, donem)` (the day AFTER the
+        PDF month's last calendar day).
         """
         print(f"[SISTEM] [{self.fon_kodu}] Delta motoru calisiyor: {start_date} -> {end_date}...")
+        try:
+            baseline_end = date.fromisoformat(start_date) - timedelta(days=1)
+            baseline_end_label = _format_tr_date(baseline_end)
+        except ValueError:
+            baseline_end_label = start_date
+
         _log_step(
             self.execution_logs,
-            f"Adım 1: {self.fon_kodu}'nin portföy yönetim şirketine ait KAP 'Pay Alım Satım "
-            f"Bildirimi' duyuruları {start_date} – {end_date} aralığında tarandı.",
+            f"KAP API'ye delta işlemleri için POST /tr/api/disclosure/members/byCriteria "
+            f"isteği atıldı: fromDate={start_date}, toDate={end_date}, "
+            f"mkkMemberOid={self.manager_mkk_member_oid}, subject='{self.TARGET_SUBJECT}'. "
+            f"Baseline geçerlilik sonu={baseline_end_label}; bu tarihten önceki/içindeki "
+            "İşlem Tarihi satırları double-counting koruması ile reddedilecek.",
         )
 
         disclosures = self._fetch_delta_disclosures(start_date, end_date)
 
+        _log_step(
+            self.execution_logs,
+            f"KAP API yanıtı: [{start_date} – {end_date}] aralığında toplam "
+            f"{len(disclosures)} adet '{self.TARGET_SUBJECT}' bildirimi döndü "
+            f"(fon filtresi={self.fon_kodu}).",
+        )
+
         updated_data = dict(baseline_data)
         resolved: List[ResolvedDelta] = []
         unresolved: List[ParsedTransaction] = []
+        skipped_pre_baseline = 0
 
         if not disclosures:
             print(f"[SISTEM] [{self.fon_kodu}] Uygulanacak bildirim bulunamadi; baseline degistirilmedi.")
             _log_step(
                 self.execution_logs,
-                "Adım 1 tamamlandı: bu aralıkta hiç bildirim bulunamadı, baseline değiştirilmedi.",
+                f"Adım 1 sonucu: [{start_date} – {end_date}] aralığında 0 bildirim; "
+                f"baseline holdings ({len(baseline_data)} kod) değiştirilmeden korundu.",
             )
             return updated_data, resolved, unresolved
 
@@ -643,15 +709,43 @@ class KAPDeltaEngine:
                     f"[KRITIK HATA] [{self.fon_kodu}] disclosureIndex={record.disclosure_index} "
                     f"islenirken beklenmeyen hata: {exc}"
                 )
+                _log_step(
+                    self.execution_logs,
+                    f"Belge No: {record.disclosure_index} (yayın={record.publish_date}) "
+                    f"HTML parse sırasında hata verdi, atlandı: {exc}",
+                )
                 transactions = []
 
             for txn in transactions:
+                iso_txn_date = self._transaction_date_to_iso(txn.transaction_date)
+                if iso_txn_date is not None and iso_txn_date < start_date:
+                    # Publish date is in-window, but the trade itself
+                    # predates (or falls inside) the baseline PDF month --
+                    # already reflected in that PDF. Skip to avoid
+                    # double-counting.
+                    skipped_pre_baseline += 1
+                    print(
+                        f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index} "
+                        f"islem tarihi {txn.transaction_date} baseline baslangicindan "
+                        f"({start_date}) once; cift sayim riski nedeniyle atlaniyor."
+                    )
+                    _log_step(
+                        self.execution_logs,
+                        f"{txn.transaction_date} tarihli [Belge No: {txn.disclosure_index}] "
+                        f"işlemi (hisse={txn.traded_companies or ['?']}, "
+                        f"net={txn.net_nominal_tl}, fonlar={txn.related_funds}), "
+                        f"taban tarihinden ({baseline_end_label}) önce/içinde olduğu için "
+                        "double-counting koruması gereği reddedildi.",
+                    )
+                    continue
+
                 if txn.related_funds == [self.fon_kodu] and txn.net_nominal_tl is not None:
                     direction = (
                         "ALIM" if txn.net_nominal_tl > 0 else "SATIM" if txn.net_nominal_tl < 0 else "DEGISIM YOK"
                     )
                     for company in txn.traded_companies or ["BILINMEYEN"]:
-                        updated_data[company] = updated_data.get(company, 0.0) + txn.net_nominal_tl
+                        prev_lot = updated_data.get(company, 0.0)
+                        updated_data[company] = prev_lot + txn.net_nominal_tl
                         resolved.append(
                             ResolvedDelta(
                                 disclosure_index=txn.disclosure_index,
@@ -661,29 +755,42 @@ class KAPDeltaEngine:
                                 direction=direction,
                             )
                         )
+                        _log_step(
+                            self.execution_logs,
+                            f"KESİNLEŞEN DELTA uygulandı: Belge No={txn.disclosure_index}, "
+                            f"İşlem Tarihi={txn.transaction_date}, Hisse={company}, "
+                            f"Yön={direction}, Lot={_format_tr_number(abs(txn.net_nominal_tl))}, "
+                            f"Önceki={_format_tr_number(prev_lot)} -> "
+                            f"Sonraki={_format_tr_number(updated_data[company])} "
+                            f"(related_funds={txn.related_funds}).",
+                        )
                 else:
                     unresolved.append(txn)
+                    _log_step(
+                        self.execution_logs,
+                        f"ÇOKLU-FON / ÇÖZÜLEMEYEN olarak sınıflandırıldı: Belge No={txn.disclosure_index}, "
+                        f"İşlem Tarihi={txn.transaction_date}, Hisse={txn.traded_companies}, "
+                        f"İlgili Fonlar={txn.related_funds}, Net Lot={txn.net_nominal_tl}. "
+                        f"KAP fon bazlı kırılım vermediği için baseline'a uygulanmadı "
+                        f"(oransal dağıtıma aday).",
+                    )
 
             if index != len(disclosures) - 1:
                 time.sleep(self.request_delay)
 
         print(
             f"[SISTEM] [{self.fon_kodu}] Tamamlandi: {len(disclosures)} bildirim islendi -> "
-            f"{len(resolved)} tek-fonlu (uygulandi), {len(unresolved)} cok-fonlu/belirsiz (uygulanmadi)."
+            f"{len(resolved)} tek-fonlu (uygulandi), {len(unresolved)} cok-fonlu/belirsiz (uygulanmadi)"
+            + (f", {skipped_pre_baseline} baseline-oncesi islem atlaniyor" if skipped_pre_baseline else "")
+            + "."
         )
 
-        multi_fund_examples = sorted(
-            {code for txn in unresolved for code in (txn.related_funds or []) if code != self.fon_kodu}
-        )
-        examples_str = ", ".join(multi_fund_examples[:5]) + (" vb." if len(multi_fund_examples) > 5 else "")
         _log_step(
             self.execution_logs,
-            f"Adım 1 tamamlandı: {self.fon_kodu}'nin yöneticisine ait pay alım/satım bildirimleri "
-            f"tarandı, {len(disclosures)} bildirim bulundu. Bunların içinden sadece {self.fon_kodu}'yı "
-            f"kapsayan {len(resolved)} işlem doğrudan baseline'a uygulandı (kesinleşen delta); "
-            f"birden fazla fonu ({examples_str or 'başka fon içermeyen'}) aynı anda kapsayan "
-            f"{len(unresolved)} bildirim ise KAP'ta fon bazlı kırılım olmadığı için ayrı, "
-            "'çözülemedi' olarak sınıflandırıldı.",
+            f"Adım 1 özet sayaçları: API'den {len(disclosures)} bildirim; "
+            f"kesinleşen (uygulanan)={len(resolved)}; çoklu-fon/çözülemeyen={len(unresolved)}; "
+            f"double-counting reddi={skipped_pre_baseline}; "
+            f"baseline geçerlilik sonu={baseline_end_label}; delta penceresi=[{start_date} – {end_date}].",
         )
         return updated_data, resolved, unresolved
 
@@ -755,13 +862,15 @@ class KAPDeltaEngine:
         """
         result = dict(updated_data)
         proportionally_resolved: List[ProportionalResolution] = []
+        skipped_proportional = 0
 
         _log_step(
             self.execution_logs,
-            f"Adım 5 (Zaman Çizelgesi): {len(unresolved)} çözülemeyen çoklu-fon bildirimi için, "
-            "işlem tarihindeki TEFAS 'Aktif Güç' (AUM × (Hisse Senedi % + Likidite %)) değerleri "
-            "kullanılarak oransal dağıtım formülü uygulanıyor: Havuz Payı = Hedef Fonun Aktif Gücü "
-            "/ İlgili Fonların Toplam Aktif Gücü; Tahmini Lot = Toplam Net Lot × Havuz Payı.",
+            f"Oransal dağıtım başlıyor: girdi={len(unresolved)} unresolved bildirim. "
+            f"Formül: Havuz_Payı = Aktif_Güç({self.fon_kodu}, İşlem_Tarihi) / "
+            f"Σ Aktif_Güç(İlgili_Fonlar, İşlem_Tarihi); "
+            f"Tahmini_Lot = Net_Lot × Havuz_Payı. "
+            "Referans gün = İşlem Tarihi (Bildirim Tarihi değil).",
         )
 
         for txn in unresolved:
@@ -771,6 +880,12 @@ class KAPDeltaEngine:
                     f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index}: "
                     f"gecersiz/eksik islem tarihi ({txn.transaction_date!r}), islem atlaniyor."
                 )
+                skipped_proportional += 1
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL RED: Belge No={txn.disclosure_index}, İşlem Tarihi={txn.transaction_date!r} "
+                    "geçersiz/parse edilemedi; tahmin üretilmedi.",
+                )
                 continue
 
             related_funds = txn.related_funds or []
@@ -778,6 +893,12 @@ class KAPDeltaEngine:
                 print(
                     f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index}: hedef fon "
                     f"'İlgili Fonlar' listesinde yok ({related_funds}), islem atlaniyor."
+                )
+                skipped_proportional += 1
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL RED: Belge No={txn.disclosure_index}, hedef fon={self.fon_kodu} "
+                    f"'İlgili Fonlar'={related_funds} listesinde yok; tahmin üretilmedi.",
                 )
                 continue
 
@@ -796,6 +917,13 @@ class KAPDeltaEngine:
                     f"su fon(lar) icin TEFAS Aktif Guc verisi yok: {missing_funds}; Toplam Guc Havuzu "
                     "guvenilir sekilde hesaplanamadigi icin islem atlaniyor."
                 )
+                skipped_proportional += 1
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL RED: Belge No={txn.disclosure_index}, İşlem Tarihi={txn.transaction_date} "
+                    f"(ISO={iso_date}). TEFAS Aktif Güç eksik fonlar={missing_funds}; "
+                    "havuz kısmi hesaplanamayacağı için tahmin üretilmedi.",
+                )
                 continue
 
             pool_total = sum(fund_powers.values())
@@ -805,6 +933,12 @@ class KAPDeltaEngine:
                     f"Toplam Guc Havuzu {pool_total:,.2f} TL (sifir/negatif) cikti, "
                     "ZeroDivisionError riski nedeniyle islem atlaniyor."
                 )
+                skipped_proportional += 1
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL RED: Belge No={txn.disclosure_index}, İşlem Tarihi={iso_date}, "
+                    f"Toplam_Güç_Havuzu={_format_tr_number(pool_total)} TL (<=0); bölme yapılmadı.",
+                )
                 continue
 
             if txn.net_nominal_tl is None:
@@ -812,15 +946,24 @@ class KAPDeltaEngine:
                     f"[UYARI] [{self.fon_kodu}] disclosureIndex={txn.disclosure_index} ({iso_date}): "
                     "net nominal tutar (net_nominal_tl) eksik, islem atlaniyor."
                 )
+                skipped_proportional += 1
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL RED: Belge No={txn.disclosure_index}, net_nominal_tl=None; tahmin üretilmedi.",
+                )
                 continue
 
             target_power = fund_powers[self.fon_kodu]
             target_weight = target_power / pool_total
             estimated_lot = txn.net_nominal_tl * target_weight
             direction = "ALIM" if estimated_lot > 0 else "SATIM" if estimated_lot < 0 else "DEGISIM YOK"
+            powers_snapshot = ", ".join(
+                f"{code}={_format_tr_number(power)} TL" for code, power in sorted(fund_powers.items())
+            )
 
             for company in txn.traded_companies or ["BILINMEYEN"]:
-                result[company] = result.get(company, 0.0) + estimated_lot
+                prev_lot = result.get(company, 0.0)
+                result[company] = prev_lot + estimated_lot
                 proportionally_resolved.append(
                     ProportionalResolution(
                         disclosure_index=txn.disclosure_index,
@@ -835,18 +978,28 @@ class KAPDeltaEngine:
                         direction=direction,
                     )
                 )
+                _log_step(
+                    self.execution_logs,
+                    f"ORANSAL UYGULAMA: Belge No={txn.disclosure_index}, Hisse={company}, "
+                    f"İşlem Tarihi={txn.transaction_date}, İlgili Fonlar={related_funds}, "
+                    f"Aktif Güçler=[{powers_snapshot}], "
+                    f"Havuz={_format_tr_number(pool_total)} TL, "
+                    f"{self.fon_kodu}_Güç={_format_tr_number(target_power)} TL, "
+                    f"Havuz_Payı=%{_format_tr_number(target_weight * 100.0)}, "
+                    f"Net_Lot_Havuz={_format_tr_number(txn.net_nominal_tl)}, "
+                    f"Tahmini_Lot({self.fon_kodu})={_format_tr_number(estimated_lot)} ({direction}), "
+                    f"Önceki={_format_tr_number(prev_lot)} -> Sonraki={_format_tr_number(result[company])}.",
+                )
 
         print(
             f"[SISTEM] [{self.fon_kodu}] Oransal Dagitim Tamamlandi: {len(unresolved)} cozulemeyen "
             f"islemden {len(proportionally_resolved)} kayit orantili olarak dagitildi."
         )
-        skipped = len(unresolved) - len(proportionally_resolved)
         _log_step(
             self.execution_logs,
-            f"Adım 5 tamamlandı: {len(unresolved)} çözülemeyen işlemden {len(proportionally_resolved)} "
-            f"tanesi orantılı olarak dağıtılıp {self.fon_kodu}'nın güncel portföyüne eklendi; "
-            f"{skipped} tanesi ilgili fon(lar) için o güne ait TEFAS Aktif Güç verisi eksik olduğu "
-            "(veya havuz sıfır/negatif çıktığı) için TAHMİN EDİLMEDEN atlandı.",
+            f"Oransal dağıtım özet sayaçları: unresolved_girdi={len(unresolved)}, "
+            f"oransal_uygulanan_satır={len(proportionally_resolved)}, "
+            f"reddedilen_bildirim={skipped_proportional}.",
         )
         return result, proportionally_resolved
 
@@ -927,10 +1080,9 @@ def collect_global_baseline(
     )
     _log_step(
         execution_logs,
-        f"Adım 3 (Global Baseline): Keşfedilen {len(related_funds)} fonun "
-        f"({', '.join(related_funds)}) her biri için KAP'tan KENDİ en güncel 'Portföy Dağılım "
-        "Raporu' PDF'i indirilip ayrıştırılacak; bu, oransal dağıtımın dayanacağı 'Global "
-        "Baseline'ı oluşturur.",
+        f"Global baseline toplama başlıyor: hedef_fon_listesi={related_funds}, "
+        f"fon_sayısı={len(related_funds)}, KAP days_back={days_back}, "
+        "strateji=her fon için download_latest_report() (kendi en güncel PDF'i).",
     )
 
     for fon_kodu in related_funds:
@@ -953,22 +1105,33 @@ def collect_global_baseline(
             print(f"[UYARI] [{fon_kodu}] KAP'ta en guncel rapor bulunamadi/indirilemedi, atlaniyor.")
             _log_step(
                 execution_logs,
-                f"{fon_kodu}: KAP'ta güncel bir 'Portföy Dağılım Raporu' bulunamadı/indirilemedi, "
-                "bu fon Global Baseline dışında bırakıldı.",
+                f"Global baseline RED: fon={fon_kodu}, output_dir={output_dir}, "
+                f"download_latest_report sonucu={download_result!r}; holdings eklenmedi.",
             )
             continue
 
         period_key = f"{download_result['year']}_{download_result['donem']:02d}"
+        pdf_name = f"{fon_kodu}_{download_result['year']}_{download_result['donem']:02d}.pdf"
+        validity = baseline_period_end_date(int(download_result["year"]), int(download_result["donem"]))
 
         try:
             history = KAPPdfParser().parse_directory(output_dir)
         except Exception as exc:  # noqa: BLE001
             print(f"[UYARI] [{fon_kodu}] PDF parse edilirken beklenmeyen hata, atlaniyor: {exc}")
+            _log_step(
+                execution_logs,
+                f"Global baseline RED: fon={fon_kodu}, PDF={pdf_name}, parse hatası={exc}.",
+            )
             continue
 
         holdings = history.get(period_key) or {}
         if not holdings:
             print(f"[UYARI] [{fon_kodu}] {period_key} donemi icin ayristirilmis veri bos donuyor, atlaniyor.")
+            _log_step(
+                execution_logs,
+                f"Global baseline RED: fon={fon_kodu}, PDF={pdf_name}, period_key={period_key}, "
+                "parse sonucu boş holdings.",
+            )
             continue
 
         global_baseline[fon_kodu] = holdings
@@ -976,8 +1139,9 @@ def collect_global_baseline(
         print(f"[BASARILI] [{fon_kodu}] {period_key} (EN GUNCEL) baseline'i toplandi ({len(holdings)} hisse kodu).")
         _log_step(
             execution_logs,
-            f"{fon_kodu}: {period_key.replace('_', '/')} dönemine ait en güncel Portföy Dağılım "
-            f"Raporu indirildi ve ayrıştırıldı ({len(holdings)} hisse kodu bulundu).",
+            f"Global baseline OK: fon={fon_kodu}, PDF='{pdf_name}', dönem={period_key}, "
+            f"geçerlilik_sonu={_format_tr_date(validity)}, hisse_kodu_sayısı={len(holdings)}, "
+            f"örnek_kodlar={sorted(holdings)[:8]}.",
         )
 
     all_tickers = {ticker for holdings in global_baseline.values() for ticker in holdings}
@@ -987,8 +1151,9 @@ def collect_global_baseline(
     )
     _log_step(
         execution_logs,
-        f"Adım 3 tamamlandı: {len(global_baseline)}/{len(related_funds)} fon için Global Baseline "
-        f"başarıyla toplandı, toplam {len(all_tickers)} benzersiz hisse kodu bulundu.",
+        f"Global baseline özet: başarılı={len(global_baseline)}/{len(related_funds)}, "
+        f"fonlar={sorted(global_baseline)}, benzersiz_hisse={len(all_tickers)}, "
+        f"atlanan={ [c for c in related_funds if c not in global_baseline] }.",
     )
     return global_baseline, baseline_periods
 
@@ -1151,10 +1316,10 @@ def build_tefas_power_matrix(
     )
     _log_step(
         execution_logs,
-        f"Adım 4 (TEFAS Aktif Güç): {len(fund_codes)} fon için son {days_back} günün TEFAS AUM "
-        "ve portföy dağılımı verisi çekiliyor; her gün için Aktif_Güç_TL = Toplam_AUM × "
-        "(Hisse Senedi % + Likidite %) formülü uygulanacak (Likidite % = Repo/Ters-Repo + Para "
-        "Piyasası + Mevduat).",
+        f"TEFAS scrape başlıyor: data_scraper.scrape_and_update(fund_list={fund_codes}, "
+        f"days_back={days_back}), cache_file={data_scraper.DATABASE_FILE}. "
+        "Formül: Aktif_Güç_TL = ToplamDeger × (Hisse_Senedi_% + Likidite_%) / 100; "
+        "Likidite_% = Repo/Ters-Repo + Para Piyasası + Mevduat.",
     )
 
     try:
@@ -1163,8 +1328,7 @@ def build_tefas_power_matrix(
         print(f"[UYARI] TEFAS verisi cekilemedi (tum fonlar icin, oturum acilamadi olabilir): {exc}")
         _log_step(
             execution_logs,
-            f"Adım 4 başarısız: TEFAS oturumu (Playwright handshake) açılamadığı için hiçbir fon "
-            f"için Aktif Güç hesaplanamadı ({exc}).",
+            f"TEFAS scrape RED: Playwright/handshake hatası, hiç fon işlenmedi. Hata={exc}.",
         )
         return {}
 
@@ -1226,7 +1390,14 @@ def build_tefas_power_matrix(
 
         tefas_power_matrix[fund_code] = gunluk_aktif_guc
         successful_funds += 1
+        latest_day = max(gunluk_aktif_guc)
         print(f"[BASARILI] [{fund_code}] {len(gunluk_aktif_guc)} gunluk aktif guc (TL) hesaplandi.")
+        _log_step(
+            execution_logs,
+            f"TEFAS Aktif Güç OK: fon={fund_code}, gün_sayısı={len(gunluk_aktif_guc)}, "
+            f"ilk_gün={min(gunluk_aktif_guc)}, son_gün={latest_day}, "
+            f"son_gün_Aktif_Güç={_format_tr_number(gunluk_aktif_guc[latest_day])} TL.",
+        )
 
     all_days = {day for daily in tefas_power_matrix.values() for day in daily}
     total_fund_days = sum(len(daily) for daily in tefas_power_matrix.values())
@@ -1237,17 +1408,164 @@ def build_tefas_power_matrix(
     )
     _log_step(
         execution_logs,
-        f"Adım 4 tamamlandı: {successful_funds}/{len(fund_codes)} fon için TEFAS Aktif Güç "
-        f"hesaplandı, toplam {len(all_days)} farklı gün kapsandı ({total_fund_days} fon-gün kaydı). "
-        "Bu değerler, bir sonraki adımda çözülemeyen çoklu-fon işlemlerinin oransal dağıtımında "
-        "havuz büyüklüğünü belirlemek için kullanılacak.",
+        f"TEFAS güç matrisi özet: başarılı_fon={successful_funds}/{len(fund_codes)}, "
+        f"fonlar={sorted(tefas_power_matrix)}, benzersiz_gün={len(all_days)}, "
+        f"fon_gün_kaydı={total_fund_days}, "
+        f"atlanan={[c for c in fund_codes if c.strip().upper() not in tefas_power_matrix]}.",
     )
     return tefas_power_matrix
 
 
-if __name__ == "__main__":
-    from datetime import date
+# --- Step 6: live BIST prices + target fund AUM, for a "% of portfolio" weight -----
 
+
+def fetch_bist_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
+    """Fetches the latest available closing price (TL) for a batch of
+    BIST-listed tickers via `yfinance`, for the portfolio evolution
+    table's "Güncel Ağırlık (%)" column: `Hisse Pozisyon Büyüklüğü =
+    Güncel Tahmini Lot * Güncel Fiyat`, then that position size as a
+    percentage of the target fund's total AUM (see `get_latest_aum_for_fund`).
+
+    Yahoo Finance requires a ".IS" suffix for Istanbul-listed symbols
+    (e.g. "PEKGY" -> "PEKGY.IS") -- added here, transparently, so callers
+    keep working with this project's own bare ticker codes everywhere
+    else.
+
+    Issues ONE batched network request for the WHOLE ticker list (via
+    `yfinance.download(..., group_by="ticker")`), not one request per
+    ticker -- important for a 20-40 ticker portfolio, where a per-ticker
+    request pattern would be both slow and far more likely to trip
+    Yahoo Finance's own rate limiting.
+
+    Never raises, and never fabricates a price: a missing/delisted/
+    newly-IPO'd ticker, a `yfinance` import failure (library not
+    installed), a total network/API failure, or any per-ticker parsing
+    error all result in that ticker mapping to `None` in the returned
+    dict -- NOT to `0.0`, which would be silently indistinguishable from
+    a real zero price and would corrupt the weight calculation (a `None`
+    price must make the caller skip that ticker's weight entirely, per
+    this feature's spec).
+    """
+    tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    prices: Dict[str, Optional[float]] = {ticker: None for ticker in tickers}
+    if not tickers:
+        return prices
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        print(
+            "[UYARI] 'yfinance' kütüphanesi kurulu değil; güncel BIST fiyatları çekilemedi "
+            "(pip install yfinance)."
+        )
+        return prices
+
+    symbol_map = {f"{ticker}.IS": ticker for ticker in tickers}
+    symbols = list(symbol_map.keys())
+
+    print(f"[SISTEM] {len(symbols)} BIST hissesi icin guncel fiyat cekiliyor (yfinance, tek toplu istek)...")
+    try:
+        data = yf.download(
+            tickers=symbols,
+            period="5d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            auto_adjust=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - a total yfinance/network failure must never crash the caller
+        print(f"[UYARI] BIST fiyatlari cekilirken beklenmeyen hata (yfinance): {exc}")
+        return prices
+
+    if data is None or data.empty:
+        print("[UYARI] yfinance hicbir fiyat verisi dondurmedi (tum semboller icin).")
+        return prices
+
+    for symbol, ticker in symbol_map.items():
+        try:
+            try:
+                close_series = data[symbol]["Close"]
+            except (KeyError, TypeError):
+                # A single-symbol request doesn't always come back with the
+                # same MultiIndex-per-symbol column shape as a multi-symbol
+                # one across yfinance versions -- fall back to a flat
+                # "Close" column in that case.
+                close_series = data["Close"]
+            close_series = close_series.dropna()
+            if close_series.empty:
+                continue
+            prices[ticker] = float(close_series.iloc[-1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+
+    found = sum(1 for price in prices.values() if price is not None)
+    missing = [ticker for ticker, price in prices.items() if price is None]
+    print(f"[SISTEM] BIST fiyat cekme tamamlandi: {found}/{len(tickers)} hisse icin fiyat bulundu.")
+    if missing:
+        print(
+            f"[UYARI] Su hisseler icin BIST fiyati bulunamadi (delist/yeni halka arz/hatali kod olabilir): {missing}"
+        )
+
+    return prices
+
+
+def get_latest_aum_for_fund(fon_kodu: str) -> Optional[Tuple[str, float]]:
+    """Returns `(iso_date, ToplamDeger)` for `fon_kodu`'s most recent
+    TEFAS record in this sandbox's local cache (`tefas_cache.json`) --
+    the RAW total AUM figure, deliberately NOT the "Aktif Guc"
+    (equity+liquidity) figure `build_tefas_power_matrix` computes, since
+    the evolution table's "% of portfolio" weight needs the fund's TRUE
+    total size as its denominator, not a purchasing-power subset of it.
+
+    Must be called AFTER `build_tefas_power_matrix` has run at least once
+    for this fund in the current process -- that call is what populates
+    `tefas_cache.json` via `data_scraper.scrape_and_update`. This function
+    does not scrape on its own; it only reads whatever is already cached,
+    keeping it a fast, no-network lookup.
+
+    Never raises: a missing cache file, a fund with no cached records, or
+    a record with an unparseable date/AUM all result in `None` rather
+    than a crash or a fabricated figure.
+    """
+    import json
+    import os
+
+    sandbox_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_file = os.path.join(sandbox_dir, "tefas_cache.json")
+    if not os.path.exists(cache_file):
+        return None
+
+    try:
+        with open(cache_file, "r", encoding="utf-8") as file:
+            database = json.load(file)
+    except (OSError, ValueError):
+        return None
+
+    records = ((database.get(fon_kodu.strip().upper()) or {}).get("records")) or []
+    if not records:
+        return None
+
+    latest_iso: Optional[str] = None
+    latest_aum: Optional[float] = None
+    for record in records:
+        iso_date = _tarih_ddmmyyyy_to_iso(record.get("Tarih"))
+        raw_aum = record.get("ToplamDeger")
+        if iso_date is None or raw_aum is None:
+            continue
+        if latest_iso is not None and iso_date <= latest_iso:
+            continue
+        try:
+            latest_aum = float(raw_aum)
+        except (TypeError, ValueError):
+            continue
+        latest_iso = iso_date
+
+    if latest_iso is None or latest_aum is None:
+        return None
+    return latest_iso, latest_aum
+
+
+if __name__ == "__main__":
     from kap_pdf_parser import export_to_html
 
     FON_KODU = "TLY"
@@ -1273,9 +1591,9 @@ if __name__ == "__main__":
     # whatever happened to be on disk.
     _log_step(
         execution_logs,
-        f"Adım 0 (Başlangıç Portföyü): '{FON_KODU}' için KAP'ta en güncel 'Portföy Dağılım "
-        "Raporu' aranıyor (diskte önceden var olan dosyalara güvenilmiyor, KAP'a doğrudan "
-        "soruluyor).",
+        f"Adım 0: KAP'tan {FON_KODU} için en güncel 'Portföy Dağılım Raporu' soruluyor "
+        f"(KAPPdfDownloader.download_latest_report, days_back varsayılan). Diskteki eski "
+        "PDF'lere güvenilmiyor.",
     )
     with KAPPdfDownloader(fon_kodu=FON_KODU) as tly_downloader:
         tly_latest = tly_downloader.download_latest_report()
@@ -1291,24 +1609,54 @@ if __name__ == "__main__":
 
     latest_period = f"{tly_latest['year']}_{tly_latest['donem']:02d}"
     baseline_data = history.get(latest_period) or {}
+    baseline_pdf_name = f"{FON_KODU}_{tly_latest['year']}_{int(tly_latest['donem']):02d}.pdf"
 
     if not baseline_data:
         raise SystemExit(
             f"'{latest_period}' donemi indirildi ama ayristirilan veri bos donuyor; durduruluyor."
         )
 
+    baseline_year = int(tly_latest["year"])
+    baseline_donem = int(tly_latest["donem"])
+    baseline_end = baseline_period_end_date(baseline_year, baseline_donem)
+
     _log_step(
         execution_logs,
-        f"Adım 0 tamamlandı: {FON_KODU} için {latest_period.replace('_', '/')} dönemine ait en "
-        f"güncel rapor bulundu ve indirildi ({len(baseline_data)} hisse kodu). Bu, sistemin "
-        "başlangıç ('baseline') portföyünü oluşturur.",
+        f"Taban veri '{baseline_pdf_name}' olarak tespit edildi. Dönem={latest_period}, "
+        f"geçerlilik tarihi ayın son günü olan {_format_tr_date(baseline_end)} olarak atandı "
+        f"(calendar.monthrange({baseline_year}, {baseline_donem})). "
+        f"Parse edilen hisse kodu sayısı={len(baseline_data)}. "
+        f"Örnek kodlar={sorted(baseline_data)[:10]}.",
     )
 
     print("=== KAPDeltaEngine + KAPPdfParser Entegre Test ===")
     print(f"Baseline donemi: {latest_period}  ({len(baseline_data)} kod)\n")
 
+    # Double-counting fix: the monthly PDF for (year, donem) already
+    # contains holdings as of that month's LAST day. Delta must open on
+    # the next calendar day -- NOT "today - 30 days", which previously
+    # re-applied trades already baked into the baseline PDF.
+    start = baseline_period_to_delta_start(baseline_year, baseline_donem)
     end = date.today()
-    start = end - timedelta(days=30)
+    if start > end:
+        raise SystemExit(
+            f"Baseline donemi {baseline_donem:02d}/{baseline_year} henuz bitmemis "
+            f"(delta baslangici {start.isoformat()} bugunden ({end.isoformat()}) sonra); "
+            "delta araligi bos -- once sonraki ayin basini bekleyin ya da daha eski bir "
+            "baseline donemi kullanin."
+        )
+    print(
+        f"[SISTEM] Delta araligi: {start.isoformat()} -> {end.isoformat()} "
+        f"(baseline PDF {baseline_donem:02d}/{baseline_year} ayinin son gununden ertesi gun)\n"
+    )
+    _log_step(
+        execution_logs,
+        f"Delta penceresi hesaplandı: start_date={start.isoformat()} "
+        f"({_format_tr_date(start)}), end_date={end.isoformat()} ({_format_tr_date(end)}). "
+        f"Kural: start_date = baseline_period_end({_format_tr_date(baseline_end)}) + 1 gün. "
+        f"'{baseline_pdf_name}' içindeki {_format_tr_date(baseline_end)} ve öncesi "
+        "günlük bildirimler işleme ALINMAYACAK (double-counting koruması).",
+    )
 
     with KAPDeltaEngine(fon_kodu=FON_KODU, execution_logs=execution_logs) as engine:
         updated_data, resolved, unresolved = engine.apply_delta(
@@ -1409,6 +1757,78 @@ if __name__ == "__main__":
         delta = after - before
         print(f"{code:8s}  Onceki: {before:>15,.2f}   Delta: {delta:>+15,.2f}   Sonraki: {after:>15,.2f}")
 
+    print("\n=== Adım 6: Güncel BIST Fiyatları ve Portföy Ağırlığı (%) ===")
+    yf_symbols = [f"{code}.IS" for code in all_codes]
+    _log_step(
+        execution_logs,
+        f"yfinance toplu fiyat isteği: tickers={yf_symbols}, period='5d', "
+        f"group_by='ticker', ham_kod_sayısı={len(all_codes)}.",
+    )
+    current_prices = fetch_bist_prices(all_codes)
+    found_price_count = sum(1 for price in current_prices.values() if price is not None)
+    missing_price_codes = [code for code, price in current_prices.items() if price is None]
+    _log_step(
+        execution_logs,
+        f"yfinance yanıtı: fiyat_bulunan={found_price_count}/{len(all_codes)}, "
+        f"fiyat_yok={missing_price_codes or '[]'}.",
+    )
+
+    aum_info = get_latest_aum_for_fund(FON_KODU)
+    if aum_info is None:
+        print(f"[UYARI] {FON_KODU} icin tefas_cache.json'da guncel ToplamDeger (AUM) bulunamadi; agirlik (%) hesabi atlanacak.")
+        _log_step(
+            execution_logs,
+            f"AUM okuma RED: get_latest_aum_for_fund('{FON_KODU}') -> None "
+            "(tefas_cache.json'da ToplamDeger yok). Güncel Ağırlık (%) hesaplanmadı.",
+        )
+        current_aum: Optional[float] = None
+        current_aum_date: Optional[str] = None
+    else:
+        current_aum_date, current_aum = aum_info
+        print(f"[SISTEM] {FON_KODU} guncel Toplam AUM: {current_aum:,.2f} TL (tarih: {current_aum_date})")
+        _log_step(
+            execution_logs,
+            f"AUM okuma OK: fon={FON_KODU}, kaynak=tefas_cache.json, alan=ToplamDeger (ham AUM, "
+            f"Aktif Güç değil), tarih={current_aum_date}, "
+            f"değer={_format_tr_number(current_aum)} TL. Bu değer ağırlık paydasıdır.",
+        )
+
+    # Mechanical per-ticker weight audit (same formula the HTML table uses).
+    if current_aum:
+        weight_rows = []
+        for code in all_codes:
+            lot = float(updated_data.get(code, 0.0))
+            price = current_prices.get(code)
+            if price is None:
+                _log_step(
+                    execution_logs,
+                    f"{code}: yfinance fiyatı yok ({code}.IS); Güncel Ağırlık (%) atlandı "
+                    f"(lot={_format_tr_number(lot)}).",
+                )
+                continue
+            position_tl = lot * float(price)
+            weight_pct = (position_tl / current_aum) * 100.0
+            weight_rows.append((code, price, lot, position_tl, weight_pct))
+            _log_step(
+                execution_logs,
+                f"{code} hissesi için yfinance'den [{_format_tr_number(float(price))} TL] anlık "
+                f"fiyat çekildi. Pozisyon={_format_tr_number(lot)} lot × "
+                f"{_format_tr_number(float(price))} TL = {_format_tr_number(position_tl)} TL. "
+                f"Güncel Ağırlık [Pozisyon / {_format_tr_number(current_aum)} TL] formülüyle "
+                f"%{_format_tr_number(weight_pct)} olarak hesaplandı.",
+            )
+        weight_rows.sort(key=lambda row: row[4], reverse=True)
+        if weight_rows:
+            top = weight_rows[0]
+            covered = sum(row[3] for row in weight_rows)
+            _log_step(
+                execution_logs,
+                f"Ağırlık özeti: fiyatı olan hisse={len(weight_rows)}, "
+                f"en_büyük_pozisyon={top[0]} (%{_format_tr_number(top[4])}), "
+                f"fiyatı_olanların_toplam_pozisyon_AUM_payı="
+                f"%{_format_tr_number((covered / current_aum) * 100.0)}.",
+            )
+
     # Reshape into the plain dict/list shapes kap_pdf_parser.export_to_html
     # expects, so that module keeps zero hard dependency on this one's
     # dataclasses (see its own docstring: sandbox-isolated, pdfplumber only).
@@ -1453,6 +1873,9 @@ if __name__ == "__main__":
             "proportionally_resolved": proportional_plain,
             "updated_data": updated_data,
             "tefas_power_matrix": tefas_power_matrix,
+            "current_prices": current_prices,
+            "current_aum": current_aum,
+            "current_aum_date": current_aum_date,
             "execution_logs": execution_logs,
         },
     )

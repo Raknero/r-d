@@ -34,6 +34,88 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """True ONLY for the two classes of KAP/TEFAS failure that are likely a
+    transient server-side hiccup rather than a genuine, permanent problem
+    with the request itself: HTTP 429 (Too Many Requests -- we've been
+    rate-limited) or a 50x server error (500/502/503/504 -- the far end is
+    temporarily struggling). A 404 (Not Found) or 400 (Bad Request) is a
+    PERMANENT failure -- the URL/payload is wrong and will still be wrong
+    on the 2nd, 3rd, ... attempt -- so those are deliberately excluded
+    here and propagate immediately, unretried, exactly as before this
+    module had any retry logic at all.
+    """
+    if not isinstance(exc, requests.exceptions.HTTPError):
+        return False
+    response = exc.response
+    if response is None:
+        return False
+    return response.status_code == 429 or response.status_code in (500, 502, 503, 504)
+
+
+def _log_retry_attempt(retry_state) -> None:
+    """`tenacity`'s `before_sleep` hook for `_request_with_retry` below.
+
+    Always prints a Turkish, human-readable console warning. Additionally,
+    IF the call this retry belongs to was given an `execution_logs` list
+    (either as that keyword argument, or -- for retries triggered from an
+    instance method that calls `_request_with_retry` on `self`'s own
+    behalf -- discoverable via `self.execution_logs`), appends one entry
+    to it too, so a KAP/TEFAS rate-limit stall shows up in the HTML
+    report's own "Adım Adım Çalışma Günlüğü" (Execution Trace), not just
+    in the console where it would be lost after the process exits.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    status_code = getattr(getattr(exc, "response", None), "status_code", "?")
+    wait_seconds = retry_state.next_action.sleep if retry_state.next_action else 0.0
+    message = (
+        f"KAP/TEFAS API limitine takıldı (HTTP {status_code}), {wait_seconds:.0f} saniye "
+        f"beklenip tekrar deneniyor... (deneme {retry_state.attempt_number}/5)"
+    )
+    print(f"[UYARI] {message}")
+
+    execution_logs = (retry_state.kwargs or {}).get("execution_logs")
+    if execution_logs is None and retry_state.args:
+        execution_logs = getattr(retry_state.args[0], "execution_logs", None)
+    if execution_logs is not None:
+        execution_logs.append({"time": time.strftime("%H:%M:%S"), "message": message})
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_http_error),
+    wait=wait_exponential(multiplier=2, min=2, max=16),
+    stop=stop_after_attempt(5),
+    before_sleep=_log_retry_attempt,
+    reraise=True,
+)
+def _request_with_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    execution_logs: Optional[List[Dict[str, str]]] = None,
+    **kwargs,
+) -> requests.Response:
+    """Thin, purely-additive protective wrapper around `session.request()`
+    for every outbound KAP/TEFAS HTTP call in this sandbox (used by both
+    this module and `kap_delta_engine.py`, which imports it): performs the
+    request, calls `raise_for_status()`, and -- ONLY on a 429/50x (see
+    `_is_retryable_http_error`) -- retries up to 5 total attempts with
+    exponential backoff (2s, 4s, 8s, 16s between attempts). A 404/400/etc.,
+    or the 5th consecutive 429/50x, is raised immediately as a normal
+    `requests.exceptions.RequestException` -- every EXISTING call site's
+    own `try/except requests.exceptions.RequestException` block keeps
+    working completely unmodified, since that's exactly the exception
+    type this still raises in the end (`reraise=True`). `execution_logs`
+    is optional and purely for `_log_retry_attempt`'s narrative logging
+    above; it changes no request/response behavior.
+    """
+    response = session.request(method, url, **kwargs)
+    response.raise_for_status()
+    return response
 
 
 @dataclass
@@ -263,8 +345,7 @@ class KAPPdfDownloader:
         )
 
         try:
-            response = session.get(cls.FUND_DIRECTORY_URL, timeout=timeout)
-            response.raise_for_status()
+            response = _request_with_retry(session, "GET", cls.FUND_DIRECTORY_URL, timeout=timeout)
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] Dinamik fon dizini alinamadi ({cls.FUND_DIRECTORY_URL}): {exc}")
             return {}
@@ -345,8 +426,7 @@ class KAPPdfDownloader:
         )
 
         try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
+            response = _request_with_retry(self.session, "GET", url, timeout=self.timeout)
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] [{self.fon_kodu}] Rapor listesi alinamadi: {exc}")
             return []
@@ -528,10 +608,9 @@ class KAPPdfDownloader:
         """
         url = self.BASE_URL + self.DETAIL_PAGE.format(disclosure_index=disclosure_index)
         try:
-            response = self.session.get(
-                url, timeout=self.timeout, headers={"Accept": "text/html,application/xhtml+xml"}
+            response = _request_with_retry(
+                self.session, "GET", url, timeout=self.timeout, headers={"Accept": "text/html,application/xhtml+xml"}
             )
-            response.raise_for_status()
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] [{self.fon_kodu}] Detay sayfasi alinamadi (disclosureIndex={disclosure_index}): {exc}")
             return None
@@ -559,8 +638,9 @@ class KAPPdfDownloader:
         local_path = os.path.join(self.output_dir, local_filename)
 
         try:
-            response = self.session.get(url, timeout=self.timeout, headers={"Accept": "application/pdf,*/*"})
-            response.raise_for_status()
+            response = _request_with_retry(
+                self.session, "GET", url, timeout=self.timeout, headers={"Accept": "application/pdf,*/*"}
+            )
         except requests.exceptions.RequestException as exc:
             print(f"[HATA] [{self.fon_kodu}] {local_filename} indirilemedi: {exc}")
             return False
