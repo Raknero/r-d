@@ -200,11 +200,14 @@ Terminal output alone shouldn't be trusted for financial figures.
 `export_to_html(parsed_data, output_filename="parser_kontrol_raporu.html")`
 is a pure, additive export step -- it doesn't touch any parsing logic --
 that renders the nested dict from `parse_directory()` as a single,
-standalone HTML file (inline CSS, no external assets) with one table per
-period: bordered, zebra-striped, hover-highlighted rows, right-aligned
-Turkish-formatted numbers (`731256.0` -> `731.256,00`), and a `TOPLAM`
-footer row per table so the sum can be eyeballed against the PDF's own
-"GRUP TOPLAMI" line.
+standalone HTML file (inline CSS; Chart.js loaded from jsDelivr CDN when
+delta charts are present) with one table per period: bordered,
+zebra-striped, hover-highlighted rows, right-aligned Turkish-formatted
+numbers (`731256.0` -> `731.256,00`), and a `TOPLAM` footer row per table
+so the sum can be eyeballed against the PDF's own "GRUP TOPLAMI" line.
+The whole report uses a financial-terminal dark theme (slate surfaces,
+soft typography, matte emerald/brick semantic colors -- no neon reds or
+bright beige warning boxes).
 
 Running `python kap_pdf_parser.py` now does both steps: prints the parsed
 holdings to the console, then writes `parser_kontrol_raporu.html` into the
@@ -230,8 +233,10 @@ file gets extended with, in order:
    that `resolve_multi_fund_deltas` was able to estimate proportionally
    (see Step 4 below).
 5. **"Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)"** -- baseline + (2)
-   + (4), reshaped ticker-by-ticker with a % change and a click-to-expand
-   day-by-day transaction history (see its own section below).
+   + (4), reshaped ticker-by-ticker with month-to-date % change, BIST
+   price/weight columns when available, Chart.js visuals above the table,
+   and a click-to-expand day-by-day transaction history (see its own
+   section below).
 6. **"Günlük Aktif Satın Alma Gücü (TEFAS Havuzu)"** -- the raw
    `tefas_power_matrix` values that (4)'s weighting was based on, one row
    per date (most recent first), one column per fund.
@@ -261,12 +266,36 @@ per ticker:
 | Oransal Tahmini Delta Lot | Net (signed) sum of every `proportionally_resolved` entry for this ticker. |
 | İşlem Tarihçesi | Click-to-expand `<details>` list of every INDIVIDUAL dated entry behind the two delta columns above (see below). |
 | Güncel Tahmini Lot | Başlangıç + Kesinleşen + Oransal. |
-| Lot Değişim Oranı (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, green if positive, red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). |
+| Ay Başından Beri Lot Değişimi (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, matte emerald if positive, matte brick-red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). **This is month-to-date vs the last PDF baseline only** -- it resets when the next monthly KAP PDF becomes the new baseline; it is not a long-term trend. |
+| Güncel Fiyat | Latest BIST close from yfinance (`TICKER.IS`), or `-` if unavailable. |
+| Güncel Ağırlık (%) | `(Güncel Tahmini Lot × Güncel Fiyat) / fon AUM * 100` when both price and AUM exist; otherwise `-`. |
 
-Rows are sorted by the **absolute size** of the lot change (biggest movers
-first), not alphabetically -- with 20-40+ tickers per fund, an alphabetical
-listing buries the handful of rows anyone actually cares about under a
-wall of unchanged positions.
+When AUM/prices are available, rows are sorted by **Güncel Ağırlık (%)**
+descending (largest portfolio weight first); tickers without a computable
+weight fall to the end, ordered by absolute lot change. Without prices,
+sorting falls back to absolute lot-change magnitude.
+
+**Month-to-date caveat (UI, 2026-08-06):** the HTML section renders a bold
+warning above the table stating that lot-change percentages do **not**
+reflect long-term investment trend -- only activity since the last PDF
+period end -- and reset when that PDF rolls forward. Column naming
+("Ay Başından Beri Lot Değişimi (%)") matches that semantics; the
+calculation engine is unchanged.
+
+**Chart.js visuals (UI, 2026-08-06):** above the evolution table,
+`_render_evolution_charts` injects a `const chartData = ...` payload
+(`json.dumps` from the same row tuples the table already computed -- no
+engine recalculation) and two canvases via Chart.js CDN:
+
+1. **Güncel Ağırlık Dağılımı** (doughnut) -- top 10 tickers by weight;
+   remainder collapsed into a single "Diğerleri" slice.
+2. **Ay Başından Beri Lot Değişimi (%)** (bar) -- only tickers with a
+   non-zero month-to-date %; buys emerald, sells brick-red. If every
+   change is zero, an HTML placeholder replaces the bar canvas:
+   "Ay başından beri yeni işlem (delta) bulunmamaktadır."
+
+Chart chrome (legend/ticks/grid) follows the same terminal dark palette as
+the rest of the report (soft slate text, low-opacity grid lines).
 
 **"İşlem Tarihçesi" column (2026-08-03):** the cumulative delta columns
 answer "how much changed", but a user correctly pointed out they don't
@@ -585,7 +614,10 @@ parameter for the same purpose. Passing `execution_logs=None` anywhere
 care about this feature behaves exactly as it did before.
 
 `kap_pdf_parser._render_execution_log` renders the accumulated list as a
-terminal-styled (dark background, monospaced, vertical timeline line)
+terminal-styled (dark slate card, monospaced, vertical timeline line)
 block at the very TOP of `parser_kontrol_raporu.html` -- before the
 per-period grid and every delta section -- via `delta_report[
-"execution_logs"]`.
+"execution_logs"]`. The same financial-terminal dark palette used for the
+rest of the report (cards, tables, Chart.js) is derived from this log
+chrome so the page reads as one surface rather than a light report with a
+dark log bolted on.

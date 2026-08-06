@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from datetime import datetime
@@ -473,6 +474,218 @@ def _render_transaction_history_cell(history: List[dict]) -> str:
             </details>"""
 
 
+def _build_evolution_chart_payload(rows: List[tuple]) -> dict:
+    """Builds the Chart.js payload for the portfolio-evolution section
+    from the same row tuples `_render_portfolio_evolution_table` already
+    computed -- purely presentational; no engine recalculation.
+
+    Each row is
+    `(ticker, baseline_lot, resolved_delta, proportional_delta, current_lot, price, weight_pct)`.
+
+    - `weights`: top-10 tickers by Güncel Ağırlık (%), remainder collapsed
+      into a single "Diğerleri" slice (only rows with a known weight).
+    - `deltas`: finite, non-zero "Ay Başından Beri Lot Değişimi (%)"
+      values only (baseline_lot > 0 and pct != 0). Empty list means the
+      bar chart should show the no-delta placeholder instead.
+    """
+    weight_rows = [
+        (ticker, float(weight_pct))
+        for ticker, _b, _r, _p, _c, _price, weight_pct in rows
+        if weight_pct is not None
+    ]
+    weight_rows.sort(key=lambda item: item[1], reverse=True)
+
+    weight_labels: List[str] = []
+    weight_values: List[float] = []
+    if weight_rows:
+        top = weight_rows[:10]
+        rest = weight_rows[10:]
+        weight_labels = [ticker for ticker, _ in top]
+        weight_values = [round(value, 4) for _, value in top]
+        if rest:
+            weight_labels.append("Diğerleri")
+            weight_values.append(round(sum(value for _, value in rest), 4))
+
+    delta_labels: List[str] = []
+    delta_values: List[float] = []
+    for ticker, baseline_lot, _r, _p, current_lot, _price, _w in rows:
+        if not baseline_lot:
+            continue
+        pct = ((current_lot - baseline_lot) / baseline_lot) * 100.0
+        if pct == 0:
+            continue
+        delta_labels.append(ticker)
+        delta_values.append(round(pct, 4))
+
+    # Largest absolute movers first -- easier to scan than table order.
+    if delta_labels:
+        paired = sorted(zip(delta_labels, delta_values), key=lambda item: abs(item[1]), reverse=True)
+        delta_labels = [ticker for ticker, _ in paired]
+        delta_values = [value for _, value in paired]
+
+    return {
+        "weights": {"labels": weight_labels, "values": weight_values},
+        "deltas": {"labels": delta_labels, "values": delta_values},
+    }
+
+
+def _render_evolution_charts(chart_payload: dict) -> str:
+    """Renders the two Chart.js canvases (weight donut + month-to-date
+    lot-change bars) above the portfolio evolution table. Injects
+    `chartData` via `json.dumps` so the browser-side script needs no
+    further Python. If every lot-change % is zero, the bar chart is
+    replaced by an explicit HTML placeholder (no empty canvas).
+    """
+    chart_json = json.dumps(chart_payload, ensure_ascii=False)
+    has_deltas = bool(chart_payload.get("deltas", {}).get("labels"))
+    has_weights = bool(chart_payload.get("weights", {}).get("labels"))
+
+    weight_body = (
+        '<canvas id="weightChart" aria-label="Güncel Ağırlık Dağılımı"></canvas>'
+        if has_weights
+        else '<p class="chart-placeholder">Güncel ağırlık verisi bulunamadı (fiyat veya AUM eksik).</p>'
+    )
+    delta_body = (
+        '<canvas id="deltaChart" aria-label="Ay Başından Beri Lot Değişimi"></canvas>'
+        if has_deltas
+        else '<p class="chart-placeholder">Ay başından beri yeni işlem (delta) bulunmamaktadır.</p>'
+    )
+
+    return f"""
+      <div class="charts-row">
+        <div class="chart-card">
+          <h3>Güncel Ağırlık Dağılımı</h3>
+          <div class="chart-canvas-wrap">{weight_body}</div>
+        </div>
+        <div class="chart-card">
+          <h3>Ay Başından Beri Lot Değişimi (%)</h3>
+          <div class="chart-canvas-wrap">{delta_body}</div>
+        </div>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <script>
+        const chartData = {chart_json};
+        (function () {{
+          const weight = chartData.weights || {{ labels: [], values: [] }};
+          const deltas = chartData.deltas || {{ labels: [], values: [] }};
+          const weightCanvas = document.getElementById("weightChart");
+          if (weightCanvas && weight.labels.length) {{
+            new Chart(weightCanvas, {{
+              type: "doughnut",
+              data: {{
+                labels: weight.labels,
+                datasets: [{{
+                  data: weight.values,
+                  backgroundColor: [
+                    "#3b82f6", "#14b8a6", "#d97706", "#8b5cf6", "#f87171",
+                    "#0ea5e9", "#10b981", "#a78bfa", "#f59e0b", "#64748b",
+                    "#475569"
+                  ],
+                  borderWidth: 2,
+                  borderColor: "#1e293b"
+                }}]
+              }},
+              options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                color: "#cbd5e1",
+                plugins: {{
+                  legend: {{
+                    position: "bottom",
+                    labels: {{
+                      boxWidth: 12,
+                      font: {{ size: 11 }},
+                      color: "#94a3b8",
+                      padding: 12
+                    }}
+                  }},
+                  title: {{ color: "#cbd5e1" }},
+                  tooltip: {{
+                    backgroundColor: "rgba(15, 23, 42, 0.92)",
+                    titleColor: "#e2e8f0",
+                    bodyColor: "#cbd5e1",
+                    borderColor: "#334155",
+                    borderWidth: 1,
+                    callbacks: {{
+                      label: function (ctx) {{
+                        const v = ctx.parsed;
+                        return ctx.label + ": %" + (typeof v === "number" ? v.toFixed(2) : v);
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+            }});
+          }}
+          const deltaCanvas = document.getElementById("deltaChart");
+          if (deltaCanvas && deltas.labels.length) {{
+            // Mat semantic fills: emerald-400 / red-400 (no neon)
+            const colors = deltas.values.map(function (v) {{
+              return v > 0 ? "rgba(52, 211, 153, 0.75)" : "rgba(248, 113, 113, 0.75)";
+            }});
+            const borders = deltas.values.map(function (v) {{
+              return v > 0 ? "#34d399" : "#f87171";
+            }});
+            new Chart(deltaCanvas, {{
+              type: "bar",
+              data: {{
+                labels: deltas.labels,
+                datasets: [{{
+                  label: "Ay Başından Beri Lot Değişimi (%)",
+                  data: deltas.values,
+                  backgroundColor: colors,
+                  borderColor: borders,
+                  borderWidth: 1
+                }}]
+              }},
+              options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                color: "#cbd5e1",
+                plugins: {{
+                  legend: {{
+                    display: false,
+                    labels: {{ color: "#94a3b8" }}
+                  }},
+                  title: {{ color: "#cbd5e1" }},
+                  tooltip: {{
+                    backgroundColor: "rgba(15, 23, 42, 0.92)",
+                    titleColor: "#e2e8f0",
+                    bodyColor: "#cbd5e1",
+                    borderColor: "#334155",
+                    borderWidth: 1,
+                    callbacks: {{
+                      label: function (ctx) {{
+                        const v = ctx.parsed.y;
+                        const sign = v > 0 ? "+" : "";
+                        return sign + v.toFixed(2) + "%";
+                      }}
+                    }}
+                  }}
+                }},
+                scales: {{
+                  x: {{
+                    ticks: {{ maxRotation: 45, minRotation: 0, font: {{ size: 11 }}, color: "#94a3b8" }},
+                    grid: {{ color: "rgba(148, 163, 184, 0.12)" }},
+                    border: {{ color: "rgba(148, 163, 184, 0.25)" }}
+                  }},
+                  y: {{
+                    ticks: {{
+                      color: "#94a3b8",
+                      callback: function (value) {{ return value + "%"; }}
+                    }},
+                    grid: {{ color: "rgba(148, 163, 184, 0.12)" }},
+                    border: {{ color: "rgba(148, 163, 184, 0.25)" }}
+                  }}
+                }}
+              }}
+            }});
+          }}
+        }})();
+      </script>
+"""
+
+
 def _render_portfolio_evolution_table(
     baseline_data: Dict[str, float],
     resolved: List[dict],
@@ -485,9 +698,11 @@ def _render_portfolio_evolution_table(
     one row per ticker showing its FULL journey from the KAP PDF baseline
     to the current estimated holding -- Başlangıç Lot, Kesinleşen Delta
     Lot (net, signed), Oransal Tahmini Delta Lot (net, signed), Güncel
-    Tahmini Lot, and a Lot Değişim Oranı (%) that puts every other column
-    into context (a "-69 milyon lot" delta means nothing on its own; "-69
-    milyon lot, başlangıcın %35'i" does).
+    Tahmini Lot, and an "Ay Başından Beri Lot Değişimi (%)" that puts every
+    other column into context (a "-69 milyon lot" delta means nothing on
+    its own; "-69 milyon lot, başlangıcın %35'i" does). This percentage is
+    intentionally month-to-date vs the last PDF baseline -- NOT a long-term
+    trend (see the bold warning rendered above the table).
 
     `Güncel Tahmini Lot` is computed directly as `Başlangıç + Kesinleşen +
     Oransal` (not read from `updated_data`) so the table is internally
@@ -517,7 +732,8 @@ def _render_portfolio_evolution_table(
     cumulative Başlangıç/Kesinleşen/Oransal/Güncel/% figures, which are
     computed exactly as before.
 
-    Two more columns follow "Lot Değişim Oranı (%)": "Güncel Fiyat (TL)"
+    Two more columns follow "Ay Başından Beri Lot Değişimi (%)": "Güncel
+    Fiyat (TL)"
     (from `current_prices`, see `kap_delta_engine.fetch_bist_prices`) and
     "Güncel Ağırlık (%)" -- `(Güncel Tahmini Lot * Güncel Fiyat /
     current_aum) * 100`, i.e. what fraction of the fund's TOTAL AUM
@@ -527,6 +743,12 @@ def _render_portfolio_evolution_table(
     "never fabricates" contract) or a missing/zero `current_aum` renders
     both cells as a plain "-": the weight calculation is skipped for that
     row entirely, never guessed at with a 0.
+
+    Above the table, two Chart.js visuals are rendered from the SAME row
+    math (no engine changes): a donut of Güncel Ağırlık (top 10 +
+    "Diğerleri") and a bar chart of non-zero month-to-date lot-change %
+    (green buys / red sells), or an explicit placeholder when every
+    change is still 0%.
 
     Rows are sorted PRIMARILY by "Güncel Ağırlık (%)" descending (rows
     with a known weight always sort above rows without one) -- this
@@ -628,7 +850,10 @@ def _render_portfolio_evolution_table(
         else '<td class="num">-</td>'
     )
 
+    chart_html = _render_evolution_charts(_build_evolution_chart_payload(rows))
+
     return f"""
+      {chart_html}
       <div class="table-scroll">
       <table>
             <thead>
@@ -639,7 +864,7 @@ def _render_portfolio_evolution_table(
                 <th class="num">Oransal Tahmini Delta Lot</th>
                 <th>İşlem Tarihçesi</th>
                 <th class="num">Güncel Tahmini Lot</th>
-                <th class="num">Lot Değişim Oranı (%)</th>
+                <th class="num">Ay Başından Beri Lot Değişimi (%)</th>
                 <th class="num">Güncel Fiyat (TL)</th>
                 <th class="num">Güncel Ağırlık (%)</th>
               </tr>
@@ -887,7 +1112,8 @@ def _render_delta_sections(delta_report: dict) -> str:
     </section>
     <section class="period-card">
       <h2>Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti) <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Lot Değişim Oranı", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo artık "portföyün en büyük pozisyonu ne?" sorusuna göre, Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
+      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Ay Başından Beri Lot Değişimi (%)", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo "portföyün en büyük pozisyonu ne?" sorusuna göre Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
+      <p class="section-alert"><strong>DİKKAT: Lot değişim oranları uzun vadeli yatırım trendini yansıtmaz. Bu oranlar sadece son PDF taban tarihinden (ay sonu) bu yana gerçekleşen işlemleri gösterir ve her ay başında PDF'in güncellenmesiyle sıfırlanır.</strong></p>
       {evolution_html}
     </section>
     <section class="period-card">
@@ -1051,10 +1277,14 @@ def export_to_html(
 <title>KAP Portföy Dağılım Raporu - Kontrol Raporu</title>
 <style>
   * {{ box-sizing: border-box; }}
+  /* Financial terminal dark mode
+     Surface: slate-900 #0f172a / slate-800 #1e293b / slate-700 #334155
+     Type: slate-200 #e2e8f0 / slate-300 #cbd5e1 / muted slate-400 #94a3b8
+     Semantic: emerald-400 #34d399 · red-400 #f87171 · amber wash */
   body {{
     font-family: "Segoe UI", Arial, sans-serif;
-    background-color: #f4f6f8;
-    color: #1f2937;
+    background-color: #0f172a;
+    color: #cbd5e1;
     margin: 0;
     padding: 32px 24px 64px;
   }}
@@ -1065,11 +1295,13 @@ def export_to_html(
   header h1 {{
     margin: 0 0 6px;
     font-size: 24px;
-    color: #111827;
+    color: #e2e8f0;
+    font-weight: 650;
+    letter-spacing: -0.01em;
   }}
   header p {{
     margin: 0;
-    color: #6b7280;
+    color: #64748b;
     font-size: 13px;
   }}
   .grid {{
@@ -1081,18 +1313,18 @@ def export_to_html(
     align-items: flex-start;
   }}
   .period-card {{
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
+    background: #1e293b;
+    border: 1px solid #334155;
     border-radius: 10px;
     padding: 18px 20px 22px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    box-shadow: 0 4px 16px rgba(2, 6, 23, 0.35);
     flex: 1 1 340px;
     min-width: 320px;
   }}
   .period-card h2 {{
     font-size: 16px;
     margin: 0 0 14px;
-    color: #111827;
+    color: #e2e8f0;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -1100,13 +1332,14 @@ def export_to_html(
   .badge {{
     font-size: 11px;
     font-weight: 600;
-    color: #1d4ed8;
-    background: #dbeafe;
+    color: #7dd3fc;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.28);
     padding: 2px 9px;
     border-radius: 999px;
   }}
   .empty-notice {{
-    color: #9ca3af;
+    color: #64748b;
     font-style: italic;
     font-size: 13px;
   }}
@@ -1114,28 +1347,34 @@ def export_to_html(
     width: 100%;
     border-collapse: collapse;
     font-size: 13.5px;
+    color: #cbd5e1;
   }}
   thead th {{
     text-align: left;
-    background-color: #111827;
-    color: #f9fafb;
+    background-color: rgba(15, 23, 42, 0.65);
+    color: #94a3b8;
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    text-transform: none;
     padding: 9px 12px;
-    border: 1px solid #111827;
+    border: 1px solid #334155;
   }}
   tbody td, tfoot td {{
     padding: 7px 12px;
-    border: 1px solid #e5e7eb;
+    border: 1px solid rgba(51, 65, 85, 0.85);
   }}
   tbody tr:nth-child(even) {{
-    background-color: #f3f4f6;
+    background-color: rgba(15, 23, 42, 0.45);
   }}
   tbody tr:hover {{
-    background-color: #fef3c7;
+    background-color: rgba(51, 65, 85, 0.55);
   }}
   tfoot td {{
     font-weight: 700;
-    background-color: #eef2ff;
-    border-top: 2px solid #c7d2fe;
+    background-color: rgba(15, 23, 42, 0.65);
+    border-top: 2px solid #334155;
+    color: #e2e8f0;
   }}
   td.num, th.num {{
     text-align: right;
@@ -1153,40 +1392,101 @@ def export_to_html(
     flex: none;
     min-width: 0;
   }}
-  .badge.warn {{ color: #92400e; background: #fef3c7; }}
-  .badge.ok {{ color: #065f46; background: #d1fae5; }}
+  .badge.warn {{
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+  }}
+  .badge.ok {{
+    color: #34d399;
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+  }}
   .section-desc {{
     margin: -6px 0 14px;
-    color: #6b7280;
+    color: #64748b;
     font-size: 12.5px;
+    line-height: 1.5;
+  }}
+  .section-alert {{
+    margin: 0 0 18px;
+    padding: 10px 12px;
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+    border-radius: 8px;
+    color: #fbbf24;
+    font-size: 12.5px;
+    line-height: 1.45;
+  }}
+  .charts-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 0 0 20px;
+  }}
+  .chart-card {{
+    flex: 1 1 320px;
+    min-width: 280px;
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 14px 14px 10px;
+  }}
+  .chart-card h3 {{
+    margin: 0 0 10px;
+    font-size: 13.5px;
+    color: #cbd5e1;
+    font-weight: 600;
+  }}
+  .chart-canvas-wrap {{
+    position: relative;
+    height: 280px;
+    width: 100%;
+  }}
+  .chart-placeholder {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    margin: 0;
+    padding: 16px;
+    text-align: center;
+    color: #64748b;
+    font-size: 13px;
+    font-style: italic;
+    background: rgba(15, 23, 42, 0.4);
+    border-radius: 8px;
+    border: 1px dashed #334155;
   }}
   .warn-notice {{
-    color: #92400e;
-    background: #fffbeb;
-    border: 1px solid #fde68a;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.32);
     border-radius: 8px;
     padding: 10px 12px;
     font-size: 12.5px;
     margin: 14px 0 0;
   }}
-  .dir-alim {{ color: #065f46; font-weight: 600; }}
-  .dir-satim {{ color: #991b1b; font-weight: 600; }}
-  .pct-up {{ color: #065f46; font-weight: 700; }}
-  .pct-down {{ color: #991b1b; font-weight: 700; }}
-  .pct-neutral {{ color: #9ca3af; }}
+  .dir-alim {{ color: #34d399; font-weight: 600; }}
+  .dir-satim {{ color: #f87171; font-weight: 600; }}
+  .pct-up {{ color: #34d399; font-weight: 700; }}
+  .pct-down {{ color: #f87171; font-weight: 700; }}
+  .pct-neutral {{ color: #64748b; }}
   .pct-new {{
-    color: #1d4ed8;
+    color: #7dd3fc;
     font-weight: 700;
-    background: #dbeafe;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.28);
     border-radius: 6px;
     font-size: 11.5px;
     letter-spacing: 0.02em;
+    padding: 1px 6px;
   }}
   td.history-cell {{
     white-space: nowrap;
   }}
   .no-history {{
-    color: #9ca3af;
+    color: #64748b;
     font-style: italic;
     font-size: 12px;
   }}
@@ -1195,32 +1495,32 @@ def export_to_html(
   }}
   .history-details summary {{
     cursor: pointer;
-    color: #1d4ed8;
+    color: #7dd3fc;
     font-size: 12px;
     font-weight: 600;
     list-style: none;
     padding: 3px 9px;
     border-radius: 999px;
-    background: #eff6ff;
-    border: 1px solid #dbeafe;
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.25);
     white-space: nowrap;
   }}
   .history-details summary::-webkit-details-marker {{
     display: none;
   }}
   .history-details summary:hover {{
-    background: #dbeafe;
+    background: rgba(56, 189, 248, 0.16);
   }}
   .history-details[open] summary {{
-    background: #dbeafe;
+    background: rgba(56, 189, 248, 0.16);
     border-radius: 8px 8px 0 0;
   }}
   .history-list {{
     list-style: none;
     margin: 0;
     padding: 8px 10px;
-    background: #f8fafc;
-    border: 1px solid #dbeafe;
+    background: rgba(15, 23, 42, 0.75);
+    border: 1px solid #334155;
     border-top: none;
     border-radius: 0 0 8px 8px;
     min-width: 220px;
@@ -1230,9 +1530,9 @@ def export_to_html(
   .history-list li {{
     font-family: "Consolas", "Courier New", monospace;
     font-size: 12px;
-    color: #374151;
+    color: #cbd5e1;
     padding: 3px 0;
-    border-bottom: 1px dashed #e5e7eb;
+    border-bottom: 1px dashed rgba(51, 65, 85, 0.9);
   }}
   .history-list li:last-child {{
     border-bottom: none;
@@ -1246,22 +1546,22 @@ def export_to_html(
   .execution-trace {{
     max-width: 1200px;
     margin: 0 auto 28px;
-    background: #0f172a;
-    border: 1px solid #1e293b;
+    background: #1e293b;
+    border: 1px solid #334155;
     border-radius: 10px;
     padding: 20px 24px 24px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 4px 16px rgba(2, 6, 23, 0.35);
   }}
   .execution-trace h2 {{
     margin: 0 0 6px;
     font-size: 16px;
-    color: #f1f5f9;
+    color: #e2e8f0;
     display: flex;
     align-items: center;
     gap: 10px;
   }}
   .execution-trace .section-desc {{
-    color: #94a3b8;
+    color: #64748b;
     margin: 0 0 18px;
   }}
   .log-timeline {{
@@ -1289,16 +1589,17 @@ def export_to_html(
     height: 10px;
     border-radius: 50%;
     background: #38bdf8;
-    box-shadow: 0 0 0 3px #0f172a, 0 0 0 4px #334155;
+    opacity: 0.85;
+    box-shadow: 0 0 0 3px #1e293b, 0 0 0 4px #334155;
   }}
   .log-time {{
     display: inline-block;
-    color: #38bdf8;
+    color: #7dd3fc;
     font-weight: 700;
     margin-right: 10px;
   }}
   .log-message {{
-    color: #e2e8f0;
+    color: #cbd5e1;
   }}
 </style>
 </head>
