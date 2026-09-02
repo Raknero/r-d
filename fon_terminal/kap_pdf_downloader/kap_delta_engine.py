@@ -72,7 +72,21 @@ from kap_pdf_parser import KAPPdfParser
 
 def baseline_period_end_date(year: int, donem: int) -> date:
     """Last calendar day of a monthly KAP PDF baseline period
-    (e.g. 2026/07 -> 2026-07-31), via `calendar.monthrange`."""
+    (e.g. 2026/07 -> 2026-07-31), via `calendar.monthrange`.
+
+    Raises a self-explanatory `ValueError` when `donem` isn't a month.
+    `calendar.monthrange`'s own "month must be in 1..12" says nothing
+    about WHICH fund/report caused it, and KAP does occasionally file a
+    report with a non-month period tag (a week-of-year, see
+    `kap_downloader.normalize_report_period`, which is where such a tag
+    is supposed to be resolved before ever reaching this function).
+    """
+    if not isinstance(donem, int) or not 1 <= donem <= 12:
+        raise ValueError(
+            f"Baseline dönemi bir ay (1-12) olmalı, alınan donem={donem!r} (year={year!r}). "
+            "KAP bu raporu ay yerine farklı bir dönem etiketiyle (örn. hafta) yayınlamış olabilir; "
+            "kap_downloader.normalize_report_period bunu aya çevirmekle yükümlü."
+        )
     last_day = calendar.monthrange(year, donem)[1]
     return date(year, donem, last_day)
 
@@ -1112,7 +1126,20 @@ def collect_global_baseline(
 
         period_key = f"{download_result['year']}_{download_result['donem']:02d}"
         pdf_name = f"{fon_kodu}_{download_result['year']}_{download_result['donem']:02d}.pdf"
-        validity = baseline_period_end_date(int(download_result["year"]), int(download_result["donem"]))
+
+        try:
+            validity = baseline_period_end_date(int(download_result["year"]), int(download_result["donem"]))
+        except (ValueError, TypeError) as exc:
+            # A single fund's unusable period tag must never abort a loop
+            # over several funds -- skip it the same way a failed download
+            # or an empty parse is skipped.
+            print(f"[UYARI] [{fon_kodu}] Dönem bilgisi kullanilamaz, atlaniyor: {exc}")
+            _log_step(
+                execution_logs,
+                f"Global baseline RED: fon={fon_kodu}, PDF={pdf_name}, "
+                f"geçersiz dönem={download_result.get('donem')!r}, hata={exc}.",
+            )
+            continue
 
         try:
             history = KAPPdfParser().parse_directory(output_dir)
@@ -1618,7 +1645,13 @@ if __name__ == "__main__":
 
     baseline_year = int(tly_latest["year"])
     baseline_donem = int(tly_latest["donem"])
-    baseline_end = baseline_period_end_date(baseline_year, baseline_donem)
+
+    try:
+        baseline_end = baseline_period_end_date(baseline_year, baseline_donem)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(
+            f"'{FON_KODU}' baseline raporunun dönemi çözümlenemedi; durduruluyor. {exc}"
+        ) from exc
 
     _log_step(
         execution_logs,

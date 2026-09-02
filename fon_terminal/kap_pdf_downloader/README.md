@@ -35,8 +35,9 @@ KAP exposes an internal (undocumented) 2-stage backend API:
 
 1. **Disclosure list** -- `GET /tr/api/disclosure/filter/FILTERYFBF/{company_oid}/{member_oid}/{days_back}`
    returns every disclosure for the fund published in the last `days_back`
-   days as JSON, including `disclosureIndex`, `year`, `donem` (month), and
-   `attachmentCount`.
+   days as JSON, including `disclosureIndex`, `year`, `donem`, `period`,
+   and `attachmentCount`. `donem` is USUALLY the month, but not always --
+   see "Non-month period tags" below.
 2. **Attachment resolution + download** -- the disclosure's own ID is
    *not* the same as its PDF attachment's file ID (they diverge in the
    trailing hex characters), and there is no separate JSON endpoint that
@@ -53,6 +54,55 @@ a Java-serialized `byte[]` (a legacy backend artifact). The module strips
 this envelope by locating the `%PDF` magic marker in the response and
 keeping everything from there onward, which recovers the original file
 byte-for-byte.
+
+### Non-month period tags: `donem` is not always a month (2026-09-02)
+
+KAP's `donem` field is undocumented and **cannot be assumed to be a
+month**. TLY's August-2026 "Portfoy Dagilim Raporu"
+(`disclosureIndex=1657116`, published 02.09.2026) was filed with
+`donem=34` and `period="HB"` -- a week-of-year tag -- where all 13 of its
+previous reports used `donem=<month>` with `period="AB"` (monthly).
+
+That raw `34` flowed straight into `date(year, donem, 1)` in
+`find_latest_report` and killed the entire run with
+`ValueError: month must be in 1..12` (and would have hit
+`calendar.monthrange` in `kap_delta_engine` next). The report itself was a
+perfectly ordinary monthly one -- only its metadata tag was unusual: the
+attachment is named `TLY_2026.08.pdf` and page 1 reads "Ağustos-2026"
+with holdings valued 31/08/26.
+
+`normalize_report_period()` now resolves every disclosure's period to a
+real `(year, month)` before anything else touches it, with no extra
+network round-trips:
+
+1. `donem` already in 1..12 -> trust it as the month.
+2. Otherwise -> derive the month from `publishDate` **minus one month**.
+   KAP publishes a fund's monthly report in the first days of the
+   following month, which holds for every one of TLY's historical
+   filings (`donem=7` published 03.08.2026, `donem=12`/2025 published
+   06.01.2026, ...) and yields exactly August 2026 for the broken record.
+3. Neither available -> the disclosure is skipped with a `[UYARI]` rather
+   than crashing, since a period is required to name the local PDF and to
+   derive the baseline's validity date.
+
+`DisclosureRecord` keeps the raw values (`raw_donem`, `period_code`)
+alongside the normalized ones, and any normalization is printed as a
+`[BILGI]` line so a corrected period is always traceable to its source.
+
+**Second, authoritative check:** `download_latest_report` now resolves the
+attachment *before* cleaning up old local files, then runs
+`_confirm_period_from_attachment` -- the attachment's own display
+filename (`TLY_2026.08.pdf`) is set by the filer next to the document
+itself, so when it disagrees with the disclosure metadata it wins, and
+the correction is logged. Resolving first also means a period correction
+can never delete the file it was about to keep.
+
+Defense in depth on the engine side: `kap_delta_engine.
+baseline_period_end_date` raises a self-explanatory `ValueError` naming
+the offending `donem` (instead of `calendar.monthrange`'s anonymous
+"month must be in 1..12"), `collect_global_baseline` skips just that one
+fund on an unusable period rather than aborting a multi-fund loop, and
+`__main__` exits with a readable message instead of a traceback.
 
 ## Usage
 
@@ -482,17 +532,19 @@ publish on different schedules, so forcing a shared period meant any fund
 whose true latest report was newer than that period silently lost every
 month in between. The fix: each fund now calls `KAPPdfDownloader.
 download_latest_report()` (see that module's own section above), which
-queries KAP directly, converts every candidate disclosure's `(year,
-donem)` into a real `date()` object, and takes the genuine `max()` --
-then deletes any other PDF already sitting in that fund's folder so a
-stale file can never be parsed alongside the fresh one. The second return
-value, `baseline_periods`, records exactly which `(year, donem)` ended up
-being used per fund, since they are no longer forced to match.
+queries KAP directly, converts every candidate disclosure's NORMALIZED
+`(year, donem)` into a real `date()` object, and takes the genuine
+`max()` -- then deletes any other PDF already sitting in that fund's
+folder so a stale file can never be parsed alongside the fresh one. The
+second return value, `baseline_periods`, records exactly which `(year,
+donem)` ended up being used per fund, since they are no longer forced to
+match.
 
 **Never crashes on a bad fund**, by design: a fund with no registered/
-resolvable KAP identity, a failed/empty download, or an empty parse result
-are all caught individually, logged as `[UYARI]`, and simply omitted from
-the result -- one bad fund never aborts the loop. Logs a final summary
+resolvable KAP identity, a failed/empty download, an unusable period tag
+(see "Non-month period tags" above), or an empty parse result are all
+caught individually, logged as `[UYARI]`, and simply omitted from the
+result -- one bad fund never aborts the loop. Logs a final summary
 (`X/Y fon basariyla toplandi, Z benzersiz hisse kodu bulundu`).
 
 **`days_back` hard ceiling, discovered while testing this (2026-07-30):**
