@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import time
 import random
 from datetime import datetime, timedelta
@@ -19,6 +20,43 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Whether the Playwright WAF handshake runs without a visible window.
+#
+# Watching the challenge get solved is the only practical way to debug a
+# handshake failure, so the visible browser stays available -- but as a
+# toggle rather than a source edit, because `headless=False` is easy to
+# leave behind and the FastAPI server calls this from its background
+# refresh too, where a window nobody is watching just gets closed and
+# kills the page mid-poll.
+#
+# TEFAS_HANDSHAKE_HEADLESS=0 brings the window back (equivalently, pass
+# headless=False to acquire_session_credentials).
+HANDSHAKE_HEADLESS = os.environ.get("TEFAS_HANDSHAKE_HEADLESS", "1").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# --- Rate limiting -----------------------------------------------------------
+#
+# TEFAS rate-limits bursts of API calls with HTTP 429. Measured 2026-09-04:
+# scraping 11 funds back-to-back (2 requests each) succeeded for the first 6
+# and then returned 429 for EVERY remaining request. Because 429 used to be
+# handled as a plain non-200 -- logged and given up on immediately -- those
+# funds were reported as "No general info retrieved (invalid fund code...)",
+# which both hid the real cause and left their `last_scraped_date` untouched.
+# Scanning always in database insertion order then made it deterministic:
+# the same trailing funds (i.e. the most recently ADDED ones) were rate
+# limited on every single run and could stay stale for days.
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 20
+RATE_LIMIT_MAX_DELAY_SECONDS = 120
+
+# Pause between two consecutive funds in a scrape run. Deliberately well
+# above the old 1.5-3.5s: that pace reliably tripped the 429 limiter partway
+# through a multi-fund run. Background refreshes are not latency-sensitive,
+# so paying ~1 extra minute across a dozen funds is far cheaper than losing
+# half of them to rate limiting and having to retry.
+INTER_FUND_DELAY_RANGE_SECONDS = (5.0, 9.0)
 
 # Keys found in the distribution endpoint response that describe metadata
 # rather than an actual asset allocation percentage. Everything else in a
@@ -196,6 +234,7 @@ def acquire_session_credentials(
     recon_mode=False,
     poll_interval_ms=1000,
     max_poll_seconds=30,
+    headless=None,
 ):
     """Launches a Chromium instance, loads the TEFAS fund data page
     with query parameters that force the Next.js frontend to immediately
@@ -217,14 +256,25 @@ def acquire_session_credentials(
     fires its client-side request. The browser is closed as soon as the
     token is found (or once the poll budget is exhausted).
 
-    Returns a tuple (auth_header, cookies_header) or (None, None) on failure.
+    `headless` defaults to HANDSHAKE_HEADLESS (see that constant for why
+    running headless matters here); pass False explicitly to watch the
+    challenge being solved while debugging.
+
+    Returns a tuple (auth_header, cookies_header) or (None, None) on failure
+    -- including when Playwright itself fails (browser closed mid-poll,
+    crash, launch error), which is reported like any other failed handshake
+    rather than raised. See the try/except around the browser block.
     """
+    if headless is None:
+        headless = HANDSHAKE_HEADLESS
+
     trigger_url = (
         f"https://www.tefas.gov.tr/tr/fon-verileri?fundType=YAT&search=TLY"
         f"&startDate={basTarih_str}&endDate={bitTarih_str}"
     )
 
-    print("[HANDSHAKE] Launching headless browser to solve Next.js auth challenge...")
+    mode = "headless" if headless else "visible"
+    print(f"[HANDSHAKE] Launching {mode} browser to solve Next.js auth challenge...")
 
     # Plain dict, mutated in place by the request listener closure so the
     # polling loop below (running in the same sync context) can observe it.
@@ -255,11 +305,9 @@ def acquire_session_credentials(
     with sync_playwright() as playwright:
         # --disable-blink-features=AutomationControlled strips the basic
         # `navigator.webdriver` flag that WAFs/bot-detection scripts check
-        # for, since Playwright/Chromium sets it by default. Runs headless
-        # now that the WAF challenge and correct endpoints/payloads have
-        # been diagnosed via visual/recon debugging.
+        # for, since Playwright/Chromium sets it by default.
         browser = playwright.chromium.launch(
-            headless=False,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
         try:
@@ -307,9 +355,25 @@ def acquire_session_credentials(
                         f"{c['name']}={c['value']}" for c in context_cookies
                     )
 
+        except Exception as exc:  # noqa: BLE001
+            # A handshake is allowed to FAIL, but it must never explode: the
+            # browser/page can disappear mid-poll (window closed by hand when
+            # running non-headless, tab crash, WAF killing the session), and
+            # `page.wait_for_timeout` then raises "Target page, context or
+            # browser has been closed". That exception used to propagate all
+            # the way out of `scrape_and_update` -- past its per-fund
+            # try/except, since the handshake happens BEFORE the fund loop --
+            # so one closed window meant zero funds refreshed. Degrading to
+            # the normal "(None, None)" failure path keeps a flaky handshake
+            # a handshake problem instead of a whole-run outage.
+            print(f"[ERROR] [HANDSHAKE] Browser handshake failed: {exc}")
+
         finally:
-            browser.close()
-            print("[HANDSHAKE] Headless browser closed.")
+            try:
+                browser.close()
+                print(f"[HANDSHAKE] Browser closed ({mode}).")
+            except Exception as exc:  # noqa: BLE001 - already-dead browser
+                print(f"[HANDSHAKE] [INFO] Browser was already closed: {exc}")
 
     if not captured["authorization"]:
         print("[ERROR] [HANDSHAKE] Failed to capture a Bearer Authorization token from any request.")
@@ -452,20 +516,48 @@ def build_distribution_payload(fund_code, bas_tarih, bit_tarih):
     }
 
 
+def rate_limit_delay_seconds(response, retry_index):
+    """Seconds to wait before retrying a rate-limited (HTTP 429) request.
+
+    Prefers TEFAS's own `Retry-After` header when it sends one (seconds
+    form), otherwise falls back to exponential backoff
+    (20s -> 40s -> 80s), capped at RATE_LIMIT_MAX_DELAY_SECONDS. A little
+    jitter is added so several funds retrying in the same run don't line up
+    into a synchronized burst that trips the limiter all over again.
+    """
+    retry_after = (response.headers.get("Retry-After") or "").strip()
+    if retry_after:
+        try:
+            return min(float(retry_after), RATE_LIMIT_MAX_DELAY_SECONDS)
+        except ValueError:
+            pass
+
+    delay = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** retry_index)
+    return min(delay, RATE_LIMIT_MAX_DELAY_SECONDS) + random.uniform(0, 3)
+
+
 def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
     """Issues a POST request to a TEFAS API endpoint with the given payload
     and returns a (records, session) tuple for the given fund.
 
-    Smart retry: if TEFAS responds with HTTP 401/403, the cached session
-    token has expired or been rejected. In that case the in-memory cache is
-    invalidated, a fresh Playwright handshake is triggered to obtain a new
-    token/cookie pair, a new authenticated `requests.Session` is built from
-    it, and the request is retried exactly once with the refreshed session.
-    The (possibly refreshed) session is always returned so the caller can
-    keep reusing it for subsequent requests in the same run instead of
-    re-authenticating again.
+    Two distinct failures are retried, each with its own budget:
+
+    - **HTTP 401/403** -- the cached session token has expired or been
+      rejected. The in-memory cache is invalidated, a fresh Playwright
+      handshake obtains a new token/cookie pair, a new authenticated
+      `requests.Session` is built from it, and the request is retried once.
+      The (possibly refreshed) session is always returned so the caller can
+      keep reusing it for the rest of the run.
+    - **HTTP 429** -- TEFAS is rate limiting us (see RATE_LIMIT_MAX_RETRIES).
+      This is a TRANSIENT condition, so the request waits and retries
+      instead of giving up: treating it as permanent is what previously
+      caused whole funds to be silently dropped from a multi-fund run and
+      mislabelled as "invalid fund code".
     """
-    for attempt in range(2):
+    auth_retries = 0
+    rate_limit_retries = 0
+
+    while True:
         try:
             response = session.post(url, json=payload, timeout=20)
         except requests.exceptions.RequestException as exc:
@@ -473,13 +565,14 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
             return [], session
 
         if response.status_code in (401, 403):
-            if attempt == 1:
+            if auth_retries >= 1:
                 print(
                     f"[ERROR] [{fund_code}] {url} still returned HTTP {response.status_code} "
                     "after refreshing the session token; giving up for this request."
                 )
                 return [], session
 
+            auth_retries += 1
             print(
                 f"[WARNING] [{fund_code}] {url} returned HTTP {response.status_code} "
                 "(session token expired/rejected). Re-authenticating via Playwright and retrying..."
@@ -491,6 +584,25 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
                 return [], session
 
             session = build_authenticated_session(auth_header, cookie_header)
+            continue
+
+        if response.status_code == 429:
+            if rate_limit_retries >= RATE_LIMIT_MAX_RETRIES:
+                print(
+                    f"[ERROR] [{fund_code}] {url} hala HTTP 429 donuyor "
+                    f"({RATE_LIMIT_MAX_RETRIES} yeniden denemeden sonra); bu istek birakildi. "
+                    "TEFAS istek limiti asildi -- fon kodu gecersiz DEGIL."
+                )
+                return [], session
+
+            delay = rate_limit_delay_seconds(response, rate_limit_retries)
+            rate_limit_retries += 1
+            print(
+                f"[WARNING] [{fund_code}] {url} HTTP 429 (TEFAS istek limiti) dondurdu; "
+                f"{delay:.1f}s beklenip tekrar denenecek "
+                f"({rate_limit_retries}/{RATE_LIMIT_MAX_RETRIES})."
+            )
+            time.sleep(delay)
             continue
 
         if response.status_code != 200:
@@ -508,8 +620,6 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
             print(f"[WARNING] [{fund_code}] No records found in response from {url}")
 
         return filter_by_fund_code(records, fund_code), session
-
-    return [], session
 
 
 # --- Response parsing / merging ---------------------------------------------
@@ -760,7 +870,16 @@ def scrape_and_update(fund_list, days_back=30):
                 )
 
             if not general_records:
-                message = "No general info retrieved (invalid fund code, or no data for this period)."
+                # Deliberately does NOT claim the fund code is invalid: the
+                # most common cause in practice is TEFAS rate limiting (HTTP
+                # 429), which is logged in detail by fetch_endpoint_data just
+                # above. Blaming the fund code here sent past debugging in
+                # entirely the wrong direction.
+                message = (
+                    "No general info retrieved -- see the errors logged above "
+                    "(TEFAS rate limit, expired session, invalid fund code, or "
+                    "genuinely no data for this period)."
+                )
                 print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
                 results[fund_code] = {"status": "error", "message": message}
                 continue
@@ -814,7 +933,7 @@ def scrape_and_update(fund_list, days_back=30):
             results[fund_code] = {"status": "error", "message": str(exc)}
 
         if raw_fund_code != fund_list[-1]:
-            time.sleep(random.uniform(1.5, 3.5))
+            time.sleep(random.uniform(*INTER_FUND_DELAY_RANGE_SECONDS))
 
     print("\n[SYSTEM] All funds processed. Database is up to date.")
     return results
@@ -824,4 +943,21 @@ def scrape_and_update(fund_list, days_back=30):
 
 if __name__ == "__main__":
     print("[SYSTEM] Initializing TEFAS API Data Scraper (hybrid mode)...")
-    scrape_and_update(["TLY", "PHE", "YAS"])
+
+    # Scrapes whatever is actually tracked in fund_database.json rather than
+    # a hardcoded list. The previous hardcoded ["TLY", "PHE", "YAS"] silently
+    # rotted as funds were added and removed through the UI: it refreshed
+    # three funds (one of which, YAS, no longer existed in the database at
+    # all) while leaving every other tracked fund untouched -- so a CLI/cron
+    # run looked successful while most funds kept serving stale data.
+    # A fund code passed on the command line overrides this, e.g.
+    #     python data_scraper.py TLY PHE
+    cli_fund_codes = [code.strip().upper() for code in sys.argv[1:] if code.strip()]
+    fund_codes = cli_fund_codes or sorted(load_database().keys())
+
+    if not fund_codes:
+        print(f"[SYSTEM] {DATABASE_FILE} icinde takip edilen fon yok; yapilacak is bulunamadi.")
+    else:
+        source = "komut satiri" if cli_fund_codes else DATABASE_FILE
+        print(f"[SYSTEM] {len(fund_codes)} fon {source} kaynagindan alindi: {', '.join(fund_codes)}")
+        scrape_and_update(fund_codes)
