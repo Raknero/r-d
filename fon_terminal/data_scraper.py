@@ -51,12 +51,75 @@ RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BASE_DELAY_SECONDS = 20
 RATE_LIMIT_MAX_DELAY_SECONDS = 120
 
-# Pause between two consecutive funds in a scrape run. Deliberately well
-# above the old 1.5-3.5s: that pace reliably tripped the 429 limiter partway
-# through a multi-fund run. Background refreshes are not latency-sensitive,
-# so paying ~1 extra minute across a dozen funds is far cheaper than losing
-# half of them to rate limiting and having to retry.
+# Pause between two consecutive funds, used ONLY by the per-fund fallback
+# path (see `scrape_fund_individually`). Deliberately well above the old
+# 1.5-3.5s: that pace reliably tripped the 429 limiter partway through a
+# multi-fund run. The bulk path doesn't need this at all, because it issues
+# a request count that doesn't grow with the number of funds.
 INTER_FUND_DELAY_RANGE_SECONDS = (5.0, 9.0)
+
+# --- Bulk (all-funds) fetching ----------------------------------------------
+#
+# Both TEFAS endpoints are really "list funds, optionally filtered" queries:
+# passing no fund filter returns EVERY fund in one response. Measured
+# 2026-09-04 against the live site:
+#
+#   fonGnlBlgSiraliGetirDosya, fonKod=None, 1 day  -> 2041 funds, 0.45s, 444 KB
+#   dagilimSiraliGetirT, aramaMetni=None, 1 day    -> 1907 funds, 1.01s, 1.4 MB
+#
+# So a refresh costs the SAME number of requests regardless of how many
+# funds are tracked, instead of 2 per fund: 2 for a routine incremental
+# window, plus a page or two more only when a wide backfill window pushes
+# the distribution endpoint past one page. For 30 funds that is ~2 requests
+# and a couple of seconds instead of 60 requests and ~200s of inter-fund
+# pauses, plus the 429 storms a 60-request burst reliably provokes. It is
+# also markedly gentler on TEFAS.
+#
+# The distribution endpoint paginates via basSira/bitSira -- a 1-indexed,
+# inclusive row range (verified: rows 1-100 and 101-200 don't overlap and
+# compose exactly into 1-200). The frontend's default of 100 rows truncates
+# a bulk query badly, and a single large page isn't enough either: an
+# all-funds pull is ~2000 rows per day, so a 30-day backfill needs ~47k
+# rows and silently stopped at whatever ceiling we asked for. Requests are
+# therefore paged until a short page proves the end was reached.
+BULK_PAGE_SIZE = 20000
+
+# Hard stop on paging, so a misbehaving response can't spin forever.
+# 10 pages x 20000 rows covers ~100 days of every fund on TEFAS.
+BULK_MAX_PAGES = 10
+
+# --- Choosing between bulk and targeted requests -----------------------------
+#
+# Bulk isn't unconditionally cheaper. Its cost scales with the WIDTH OF THE
+# DATE WINDOW (it downloads every fund for every day in range), while the
+# targeted path's cost scales with the NUMBER OF FUNDS (2 requests each,
+# plus a 5-9s pause between them). Measured 2026-09-09, 30-day window:
+#
+#   one fund, targeted   -> 0.63s   (2 requests, 23+23 rows)
+#   all funds, bulk      -> 15.74s  (4 requests, 46816+46629 rows)
+#
+# So a single fund being backfilled -- exactly what /api/add-fund does -- is
+# ~25x faster targeted, while the hourly refresh of a dozen funds over a
+# 3-day window is ~40x faster in bulk (0.8s vs 22 requests and ~70s of
+# pauses). The run picks whichever fits; see `should_use_bulk`.
+BULK_MIN_FUNDS = 3
+BULK_CHEAP_WINDOW_DAYS = 10
+
+# Days of already-stored history re-fetched on every run. TEFAS revises
+# published values after the fact, so the newest few days are pulled again
+# rather than trusted permanently once seen.
+BULK_WINDOW_OVERLAP_DAYS = 3
+
+# Ceiling on the incremental window. A wider window multiplies the bulk
+# response size (~1.4 MB per day of distribution data for all funds), so a
+# fund that has been stale for months is caught up over consecutive runs
+# instead of in one huge request.
+MAX_BULK_WINDOW_DAYS = 60
+
+# A bulk response is far bigger than a single fund's (measured 7.3 MB for a
+# 5-day all-funds distribution pull, 4.4s), so the old 20s per-request
+# timeout is too tight to double as the bulk ceiling.
+BULK_REQUEST_TIMEOUT_SECONDS = 90
 
 # Keys found in the distribution endpoint response that describe metadata
 # rather than an actual asset allocation percentage. Everything else in a
@@ -470,6 +533,195 @@ def build_authenticated_session(auth_header, cookie_header):
 
 # --- TEFAS API access --------------------------------------------------------
 
+def build_plain_session():
+    """An unauthenticated session for the bulk endpoints.
+
+    Measured 2026-09-04: `fonGnlBlgSiraliGetirDosya` and
+    `dagilimSiraliGetirT` both return full data over plain HTTPS with no
+    Bearer token, no WAF cookies, and no User-Agent (5/5 attempts, HTTP 200).
+    The Playwright handshake that the rest of this module is built around is
+    therefore not needed for the data path, and skipping it saves the ~4-6s
+    browser launch on every run while removing the biggest bot-detection
+    surface we have.
+
+    This is an observation about TEFAS's current behavior, not a guarantee:
+    a browser-like User-Agent is still sent, and if TEFAS starts enforcing
+    credentials again the 401/403 branch in `post_tefas_endpoint`
+    transparently performs the handshake and retries. The handshake code
+    stays as the fallback rather than the default.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": TEFAS_DATA_PAGE,
+    })
+    return session
+
+
+def group_records_by_fund(records):
+    """Groups a bulk response into {FUND_CODE: [records]} in one pass.
+
+    The per-fund path calls `filter_by_fund_code` once per fund, which would
+    mean re-walking a ~10k-row bulk response for every tracked fund.
+    """
+    grouped = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        code = get_field(record, "FONKODU", "FonKodu", "fonKodu", "fonkodu")
+        if code is None:
+            continue
+        grouped.setdefault(str(code).strip().upper(), []).append(record)
+    return grouped
+
+
+def latest_stored_date(entry):
+    """Newest `Tarih` (as a date) already stored for a fund, or None."""
+    records = (entry or {}).get("records") or []
+    newest = None
+    for record in records:
+        raw = record.get("Tarih")
+        if not raw:
+            continue
+        try:
+            day, month, year = str(raw).split(".")
+            parsed = datetime(int(year), int(month), int(day)).date()
+        except (ValueError, TypeError):
+            continue
+        if newest is None or parsed > newest:
+            newest = parsed
+    return newest
+
+
+def compute_scrape_window(database, fund_list, days_back):
+    """Chooses the date range to request, as (bas_tarih, bit_tarih, reason).
+
+    The old behavior was to always ask for the last `days_back` (30) days
+    for every fund on every run, which re-downloaded a month of history to
+    learn about one new day. The window is now derived from what's already
+    stored:
+
+    - Any tracked fund with no records at all needs its history built, so
+      the full `days_back` window is used (a brand-new fund added from the
+      UI gets its 30 days in the same request everyone else is served by).
+    - Otherwise the window starts at the OLDEST "newest stored date" across
+      the requested funds, minus BULK_WINDOW_OVERLAP_DAYS so recently
+      published values are re-checked for revisions.
+
+    Capped at MAX_BULK_WINDOW_DAYS: response size grows with the window, so
+    a badly stale fund catches up over consecutive runs rather than in one
+    enormous request.
+    """
+    today = datetime.now().date()
+    bit_tarih = today.strftime("%Y%m%d")
+
+    newest_dates = []
+    for raw_code in fund_list:
+        code = raw_code.strip().upper()
+        newest = latest_stored_date(database.get(code))
+        if newest is None:
+            return (
+                (today - timedelta(days=days_back)).strftime("%Y%m%d"),
+                bit_tarih,
+                f"{code} icin gecmis yok; {days_back} gunluk dolum penceresi",
+            )
+        newest_dates.append(newest)
+
+    if not newest_dates:
+        return (
+            (today - timedelta(days=days_back)).strftime("%Y%m%d"),
+            bit_tarih,
+            f"{days_back} gunluk varsayilan pencere",
+        )
+
+    stale_days = (today - min(newest_dates)).days
+    window_days = min(max(stale_days + BULK_WINDOW_OVERLAP_DAYS, 1), MAX_BULK_WINDOW_DAYS)
+    reason = (
+        f"artimli pencere: en bayat fon {stale_days} gun geride, "
+        f"+{BULK_WINDOW_OVERLAP_DAYS} gun revizyon payi"
+    )
+    if window_days == MAX_BULK_WINDOW_DAYS and stale_days + BULK_WINDOW_OVERLAP_DAYS > MAX_BULK_WINDOW_DAYS:
+        reason = f"{MAX_BULK_WINDOW_DAYS} gunluk tavana kirpildi (fon {stale_days} gun geride)"
+
+    return (today - timedelta(days=window_days)).strftime("%Y%m%d"), bit_tarih, reason
+
+
+def should_use_bulk(fund_count, window_days):
+    """Whether to serve this run from one all-funds response.
+
+    Bulk wins as soon as a few funds are involved, because its request count
+    is flat in fund count. It loses only in the one case where the window is
+    wide AND barely any funds need it: pulling ~47k rows of every fund's
+    month to update one fund is far more work than asking for that fund's
+    month directly.
+    """
+    if fund_count >= BULK_MIN_FUNDS:
+        return True
+    return window_days <= BULK_CHEAP_WINDOW_DAYS
+
+
+def window_length_days(bas_tarih, bit_tarih):
+    """Days spanned by a YYYYMMDD window, used to size up its cost."""
+    try:
+        start = datetime.strptime(bas_tarih, "%Y%m%d").date()
+        end = datetime.strptime(bit_tarih, "%Y%m%d").date()
+    except (ValueError, TypeError):
+        return 0
+    return max((end - start).days, 0)
+
+
+def fetch_bulk_records(session, url, payload, bas_tarih, bit_tarih, label):
+    """One bulk request, with timing logging so a slow response is visible
+    in the logs rather than inferred."""
+    started = time.perf_counter()
+    records, session = post_tefas_endpoint(
+        session, url, payload, f"BULK/{label}", bas_tarih, bit_tarih
+    )
+    elapsed = time.perf_counter() - started
+    print(f"[BULK] {label}: {len(records)} kayit, {elapsed:.2f}s")
+    return records, session
+
+
+def fetch_bulk_distribution(session, bas_tarih, bit_tarih):
+    """All-funds distribution data for the window, paging until complete.
+
+    A single fixed page silently truncates: a 30-day all-funds query needs
+    ~47k rows, so asking for 20000 returned exactly 20000 and the missing
+    rows looked like funds that simply publish no distribution breakdown --
+    indistinguishable, in the logs, from a genuinely qualified/closed fund.
+    Paging until a short page arrives is what makes "no distribution data"
+    trustworthy.
+    """
+    all_records = []
+    first_row = 1
+
+    for page_index in range(BULK_MAX_PAGES):
+        payload = build_distribution_payload(
+            None, bas_tarih, bit_tarih, first_row=first_row, page_size=BULK_PAGE_SIZE
+        )
+        label = "dagilim" if page_index == 0 else f"dagilim sayfa {page_index + 1}"
+        records, session = fetch_bulk_records(
+            session, DISTRIBUTION_URL, payload, bas_tarih, bit_tarih, label
+        )
+        all_records.extend(records)
+
+        # A short page means the last row was reached.
+        if len(records) < BULK_PAGE_SIZE:
+            return all_records, session
+
+        first_row += BULK_PAGE_SIZE
+    else:
+        print(
+            f"[WARNING] [BULK] Dagilim verisi {BULK_MAX_PAGES} sayfada bitmedi "
+            f"({len(all_records)} kayit alindi); veri eksik olabilir. "
+            "Tarih penceresi daraltilmali."
+        )
+
+    return all_records, session
+
+
 def build_general_info_payload(fund_code, bas_tarih, bit_tarih):
     """Payload schema for `fonGnlBlgSiraliGetirDosya`, the unpaginated
     "file export" variant of the general info endpoint (bypasses the
@@ -490,10 +742,15 @@ def build_general_info_payload(fund_code, bas_tarih, bit_tarih):
     }
 
 
-def build_distribution_payload(fund_code, bas_tarih, bit_tarih):
+def build_distribution_payload(fund_code, bas_tarih, bit_tarih, first_row=1, page_size=100):
     """Payload schema for `dagilimSiraliGetirT`, the portfolio distribution
     endpoint, captured via Playwright recon after manually triggering the
     "Portföy Dağılımı" / "Varlık Dağılımı" tab.
+
+    `fund_code=None` drops the fund filter so every fund is returned.
+    `first_row`/`page_size` map onto the endpoint's 1-indexed inclusive
+    basSira/bitSira row range; see `fetch_bulk_distribution` for why bulk
+    queries must page rather than ask for one huge range.
     """
     return {
         "fonTipi": "YAT",
@@ -504,8 +761,8 @@ def build_distribution_payload(fund_code, bas_tarih, bit_tarih):
         "sfonTurKod": None,
         "basTarih": bas_tarih,
         "bitTarih": bit_tarih,
-        "basSira": 1,
-        "bitSira": 100,
+        "basSira": first_row,
+        "bitSira": first_row + page_size - 1,
         "fonTurAciklama": None,
         "dil": "TR",
         "kurucuKod": None,
@@ -536,18 +793,23 @@ def rate_limit_delay_seconds(response, retry_index):
     return min(delay, RATE_LIMIT_MAX_DELAY_SECONDS) + random.uniform(0, 3)
 
 
-def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
-    """Issues a POST request to a TEFAS API endpoint with the given payload
-    and returns a (records, session) tuple for the given fund.
+def post_tefas_endpoint(session, url, payload, label, bas_tarih, bit_tarih):
+    """Issues a POST to a TEFAS API endpoint and returns (records, session)
+    with every record the response contained, unfiltered.
+
+    `label` only tags log lines -- a fund code on the per-fund path, or
+    something like "BULK" when one request covers all funds.
 
     Two distinct failures are retried, each with its own budget:
 
-    - **HTTP 401/403** -- the cached session token has expired or been
-      rejected. The in-memory cache is invalidated, a fresh Playwright
-      handshake obtains a new token/cookie pair, a new authenticated
-      `requests.Session` is built from it, and the request is retried once.
-      The (possibly refreshed) session is always returned so the caller can
-      keep reusing it for the rest of the run.
+    - **HTTP 401/403** -- the session was rejected. The in-memory token cache
+      is invalidated, a fresh Playwright handshake obtains a new
+      token/cookie pair, a new authenticated `requests.Session` is built
+      from it, and the request is retried once. The (possibly refreshed)
+      session is always returned so the caller can keep reusing it. This is
+      also what upgrades an unauthenticated session (see
+      `build_plain_session`) to a full WAF handshake if TEFAS ever starts
+      demanding credentials on these endpoints again.
     - **HTTP 429** -- TEFAS is rate limiting us (see RATE_LIMIT_MAX_RETRIES).
       This is a TRANSIENT condition, so the request waits and retries
       instead of giving up: treating it as permanent is what previously
@@ -559,28 +821,28 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
 
     while True:
         try:
-            response = session.post(url, json=payload, timeout=20)
+            response = session.post(url, json=payload, timeout=BULK_REQUEST_TIMEOUT_SECONDS)
         except requests.exceptions.RequestException as exc:
-            print(f"[ERROR] [{fund_code}] Network error calling {url}: {exc}")
+            print(f"[ERROR] [{label}] Network error calling {url}: {exc}")
             return [], session
 
         if response.status_code in (401, 403):
             if auth_retries >= 1:
                 print(
-                    f"[ERROR] [{fund_code}] {url} still returned HTTP {response.status_code} "
+                    f"[ERROR] [{label}] {url} still returned HTTP {response.status_code} "
                     "after refreshing the session token; giving up for this request."
                 )
                 return [], session
 
             auth_retries += 1
             print(
-                f"[WARNING] [{fund_code}] {url} returned HTTP {response.status_code} "
-                "(session token expired/rejected). Re-authenticating via Playwright and retrying..."
+                f"[WARNING] [{label}] {url} returned HTTP {response.status_code} "
+                "(session rejected). Re-authenticating via Playwright and retrying..."
             )
             invalidate_cached_credentials()
             auth_header, cookie_header = get_session_credentials(bas_tarih, bit_tarih, force_refresh=True)
             if not auth_header:
-                print(f"[ERROR] [{fund_code}] Failed to refresh TEFAS session; aborting retry.")
+                print(f"[ERROR] [{label}] Failed to refresh TEFAS session; aborting retry.")
                 return [], session
 
             session = build_authenticated_session(auth_header, cookie_header)
@@ -589,7 +851,7 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
         if response.status_code == 429:
             if rate_limit_retries >= RATE_LIMIT_MAX_RETRIES:
                 print(
-                    f"[ERROR] [{fund_code}] {url} hala HTTP 429 donuyor "
+                    f"[ERROR] [{label}] {url} hala HTTP 429 donuyor "
                     f"({RATE_LIMIT_MAX_RETRIES} yeniden denemeden sonra); bu istek birakildi. "
                     "TEFAS istek limiti asildi -- fon kodu gecersiz DEGIL."
                 )
@@ -598,7 +860,7 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
             delay = rate_limit_delay_seconds(response, rate_limit_retries)
             rate_limit_retries += 1
             print(
-                f"[WARNING] [{fund_code}] {url} HTTP 429 (TEFAS istek limiti) dondurdu; "
+                f"[WARNING] [{label}] {url} HTTP 429 (TEFAS istek limiti) dondurdu; "
                 f"{delay:.1f}s beklenip tekrar denenecek "
                 f"({rate_limit_retries}/{RATE_LIMIT_MAX_RETRIES})."
             )
@@ -606,20 +868,32 @@ def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
             continue
 
         if response.status_code != 200:
-            print(f"[ERROR] [{fund_code}] {url} returned HTTP {response.status_code}")
+            print(f"[ERROR] [{label}] {url} returned HTTP {response.status_code}")
             return [], session
 
         try:
             payload_json = response.json()
         except ValueError:
-            print(f"[ERROR] [{fund_code}] Invalid JSON response from {url}")
+            print(f"[ERROR] [{label}] Invalid JSON response from {url}")
             return [], session
 
         records = extract_records(payload_json)
         if not records:
-            print(f"[WARNING] [{fund_code}] No records found in response from {url}")
+            print(f"[WARNING] [{label}] No records found in response from {url}")
 
-        return filter_by_fund_code(records, fund_code), session
+        return records, session
+
+
+def fetch_endpoint_data(session, url, fund_code, payload, bas_tarih, bit_tarih):
+    """`post_tefas_endpoint` narrowed to a single fund's records.
+
+    Used by the per-fund fallback path; the bulk path keeps the full
+    response and groups it locally instead.
+    """
+    records, session = post_tefas_endpoint(
+        session, url, payload, fund_code, bas_tarih, bit_tarih
+    )
+    return filter_by_fund_code(records, fund_code), session
 
 
 # --- Response parsing / merging ---------------------------------------------
@@ -700,6 +974,44 @@ def merge_fund_data(general_map, distribution_map):
         record["Varliklar"] = distribution_map.get(date_str, {})
         merged.append(record)
     return merged
+
+
+def general_map_has_changes(entry, general_map):
+    """Whether a freshly fetched general-info map differs from what's stored.
+
+    Lets a refresh that found nothing new skip the expensive distribution
+    request and the database write entirely. TEFAS publishes once a day, so
+    with an hourly refresh most runs have nothing to do, and rewriting a
+    large JSON file (plus logging a line per fund per date) for no reason is
+    pure waste.
+
+    Both new dates and REVISED values for an already-stored date count as
+    changes, as does a stored record that never got a distribution key at
+    all -- an empty `Varliklar` is legitimate for qualified/closed funds, a
+    missing one means we simply never fetched it.
+    """
+    stored = {
+        record.get("Tarih"): record
+        for record in (entry or {}).get("records") or []
+    }
+
+    for date_str, info in general_map.items():
+        existing = stored.get(date_str)
+        if existing is None or "Varliklar" not in existing:
+            return True
+        for key in ("Pay", "Yatirimci"):
+            if existing.get(key) != info.get(key):
+                return True
+        for key in ("Fiyat", "ToplamDeger"):
+            old_value = existing.get(key)
+            new_value = info.get(key)
+            if old_value is None or new_value is None:
+                if old_value is not new_value:
+                    return True
+            elif abs(float(old_value) - float(new_value)) > 1e-6:
+                return True
+
+    return False
 
 
 # --- Local database (fund_database.json) persistence ------------------------
@@ -798,144 +1110,275 @@ def upsert_fund_record(database, fund_code, new_record):
 
 # --- Reusable pipeline entry point -------------------------------------------
 
+def store_fund_records(database, fund_code, merged_records, quiet=False):
+    """Upserts a fund's merged records and stamps `last_scraped_date`.
+
+    Returns (inserted_count, updated_count).
+    """
+    inserted_count = 0
+    updated_count = 0
+
+    for record in merged_records:
+        if not record.get("Varliklar"):
+            # Qualified/closed funds legitimately publish no distribution
+            # breakdown; flagged per date, not treated as an error.
+            print(
+                f"[INFO] [{fund_code}] {record['Tarih']} için varlık dağılım verisi "
+                "boş/bulunamadı (Nitelikli/Kapalı fon olabilir)."
+            )
+
+        action = upsert_fund_record(database, fund_code, record)
+        if not quiet:
+            print(f"  [{fund_code}] {record['Tarih']} -> {action}")
+        if action == "inserted":
+            inserted_count += 1
+        else:
+            updated_count += 1
+
+    # Stamped regardless of whether the fund is shown on the UI or only
+    # tracked in the background, so the 15-day background-tracking cadence
+    # (see main.py's scan target selection) is measured from the most recent
+    # successful run.
+    database[fund_code]["_metadata"]["last_scraped_date"] = datetime.now().strftime("%Y-%m-%d")
+    return inserted_count, updated_count
+
+
+def scrape_fund_individually(session, database, fund_code, bas_tarih, bit_tarih, reason):
+    """Two requests scoped to one fund code.
+
+    Reached two ways: deliberately, when `should_use_bulk` decides a wide
+    window for very few funds is cheaper served directly, and as a fallback
+    when a fund is missing from an otherwise successful bulk response (e.g.
+    a type the `fonTipi: "YAT"` filter excludes). `reason` says which, so
+    the logs don't imply a failure when none occurred.
+
+    Returns (result_dict, session).
+    """
+    print(f"[TEK FON] [{fund_code}] {reason}")
+
+    general_payload = build_general_info_payload(fund_code, bas_tarih, bit_tarih)
+    distribution_payload = build_distribution_payload(fund_code, bas_tarih, bit_tarih)
+
+    general_records, session = fetch_endpoint_data(
+        session, GENERAL_INFO_URL, fund_code, general_payload, bas_tarih, bit_tarih
+    )
+    distribution_records, session = fetch_endpoint_data(
+        session, DISTRIBUTION_URL, fund_code, distribution_payload, bas_tarih, bit_tarih
+    )
+
+    if not general_records:
+        # Deliberately does NOT claim the fund code is invalid: rate
+        # limiting is the most common cause in practice and is logged in
+        # detail just above. Blaming the fund code here sent past debugging
+        # in entirely the wrong direction.
+        message = (
+            "No general info retrieved -- see the errors logged above "
+            "(TEFAS rate limit, rejected session, invalid fund code, or "
+            "genuinely no data for this period)."
+        )
+        print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
+        return {"status": "error", "message": message}, session
+
+    merged_records = merge_fund_data(
+        build_general_info_map(general_records),
+        build_distribution_map(distribution_records),
+    )
+    if not merged_records:
+        message = "Merge produced no usable records."
+        print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
+        return {"status": "error", "message": message}, session
+
+    inserted, updated = store_fund_records(database, fund_code, merged_records)
+    print(f"[SUCCESS] [{fund_code}] {inserted} inserted, {updated} updated.")
+    return {"status": "success", "inserted": inserted, "updated": updated}, session
+
+
+def scrape_funds_individually(session, database, fund_codes, bas_tarih, bit_tarih, reason):
+    """Runs the targeted path for several funds, pacing between them.
+
+    This is the only path whose request count grows with the number of
+    funds, so it's also the only one that still needs the inter-fund pause
+    that used to guard the whole pipeline against rate limiting.
+    """
+    results = {}
+    for index, fund_code in enumerate(fund_codes):
+        try:
+            result, session = scrape_fund_individually(
+                session, database, fund_code, bas_tarih, bit_tarih, reason
+            )
+            results[fund_code] = result
+        except Exception as exc:
+            print(f"[CRITICAL] [{fund_code}] Unhandled exception: {exc}")
+            results[fund_code] = {"status": "error", "message": str(exc)}
+
+        if index < len(fund_codes) - 1:
+            time.sleep(random.uniform(*INTER_FUND_DELAY_RANGE_SECONDS))
+
+    return results, session
+
+
+def _finish_scrape_run(database, results, run_started):
+    """Persists the run's changes (if any) and prints its summary.
+
+    One write per run instead of one per fund: the per-fund work is now pure
+    in-memory merging, so re-serializing the whole database after each fund
+    was measurable overhead for no added safety. A run that changed nothing
+    doesn't rewrite the file at all.
+    """
+    if any(
+        result.get("status") == "success" and (result.get("inserted") or result.get("updated"))
+        for result in results.values()
+    ):
+        save_database(database)
+        print(f"[SYSTEM] {DATABASE_FILE} kaydedildi.")
+
+    elapsed = time.perf_counter() - run_started
+    succeeded = sum(1 for result in results.values() if result.get("status") == "success")
+    print(f"[SYSTEM] Tarama bitti: {succeeded}/{len(results)} fon basarili, {elapsed:.2f}s.")
+
+
 def scrape_and_update(fund_list, days_back=30):
-    """Runs the full hybrid scraping pipeline (Playwright WAF handshake +
-    bulk `requests` API calls, completely unchanged from the standalone CLI
-    flow) for the given fund codes, merging freshly fetched data into
-    `fund_database.json`.
+    """Refreshes the given fund codes in `fund_database.json`.
 
-    Token caching: the Playwright handshake is only performed when there is
-    no valid cached session yet (see `get_session_credentials`), so calling
-    this function repeatedly within the same process -- e.g. once per
-    `/api/add-fund` request, or once per fund during the FastAPI lifespan
-    startup scan -- reuses the same token/cookie pair instead of launching a
-    new browser every time. If TEFAS ever rejects that cached token with a
-    401/403 mid-run, the affected request is automatically retried once
-    after transparently re-authenticating (see `fetch_endpoint_data`).
+    Cost is now independent of how many funds are tracked. Both TEFAS
+    endpoints return every fund when given no fund filter, so one run issues
+    the same ~2 requests for 3 funds as for 300, and the response is grouped
+    by fund code locally. The previous design sent 2 requests per fund with
+    a 5-9s pause between funds, which for 30 funds meant 60 requests and
+    ~200s of deliberate waiting, on top of the 429 throttling that a burst
+    that size reliably provoked.
 
-    This is the single reusable entry point shared by the CLI (`python
-    data_scraper.py`) and by the FastAPI `/api/add-fund` endpoint in
-    `main.py`, which calls it on demand for one newly requested fund code.
+    Three further savings compound with that:
+
+    - The date window is derived from what's already stored
+      (`compute_scrape_window`) instead of always re-requesting 30 days.
+    - Requests start on an unauthenticated session (`build_plain_session`),
+      since these endpoints currently need no token; the Playwright
+      handshake happens only if TEFAS answers 401/403.
+    - A run that finds nothing new skips the distribution request and the
+      database write entirely (`general_map_has_changes`), which is what
+      most hourly refreshes do given TEFAS publishes once a day.
+
+    Bulk is not used unconditionally: because its cost scales with the date
+    window rather than the fund count, a wide backfill window for one or two
+    funds is served far faster by targeted requests (see `should_use_bulk`).
+    A fund missing from an otherwise successful bulk response falls back to
+    the same targeted path, so bulk stays an optimization rather than a new
+    dependency.
 
     Returns a dict keyed by (uppercased) fund code, e.g.:
         {
             "TLY": {"status": "success", "inserted": 2, "updated": 28},
             "XYZ": {"status": "error", "message": "No general info retrieved..."},
         }
-
-    Raises RuntimeError if the Playwright handshake fails to obtain a valid
-    session, since no fund can be scraped without one.
     """
-    print(f"[SYSTEM] Starting scrape run for: {', '.join(fund_list)}")
+    fund_codes = [code.strip().upper() for code in fund_list if code and code.strip()]
+    if not fund_codes:
+        return {}
 
-    end_date_obj = datetime.now()
-    start_date_obj = end_date_obj - timedelta(days=days_back)
-    bit_tarih = end_date_obj.strftime("%Y%m%d")
-    bas_tarih = start_date_obj.strftime("%Y%m%d")
-
-    print(f"[SYSTEM] Fetching last {days_back} days of data: {bas_tarih} -> {bit_tarih}")
+    print(f"[SYSTEM] Starting scrape run for: {', '.join(fund_codes)}")
 
     database = load_database()
+    bas_tarih, bit_tarih, window_reason = compute_scrape_window(database, fund_codes, days_back)
+    print(f"[SYSTEM] Tarih penceresi {bas_tarih} -> {bit_tarih} ({window_reason})")
 
-    auth_header, cookie_header = get_session_credentials(bas_tarih, bit_tarih)
-    if not auth_header:
-        raise RuntimeError("Could not obtain a valid TEFAS session (Playwright handshake failed).")
-
-    session = build_authenticated_session(auth_header, cookie_header)
-
+    session = build_plain_session()
     results = {}
+    run_started = time.perf_counter()
 
-    for raw_fund_code in fund_list:
-        fund_code = raw_fund_code.strip().upper()
-        print(f"\n[{fund_code}] Requesting general info and portfolio distribution...")
+    window_days = window_length_days(bas_tarih, bit_tarih)
+    if not should_use_bulk(len(fund_codes), window_days):
+        reason = (
+            f"{len(fund_codes)} fon icin {window_days} gunluk pencere: "
+            "hedefli sorgu toplu cekimden ucuz"
+        )
+        results, session = scrape_funds_individually(
+            session, database, fund_codes, bas_tarih, bit_tarih, reason
+        )
+        _finish_scrape_run(database, results, run_started)
+        return results
+
+    # --- One request: general info for every fund ----------------------------
+    general_payload = build_general_info_payload(None, bas_tarih, bit_tarih)
+    general_records, session = fetch_bulk_records(
+        session, GENERAL_INFO_URL, general_payload, bas_tarih, bit_tarih, "genel bilgi"
+    )
+    general_by_fund = group_records_by_fund(general_records)
+
+    if not general_by_fund:
+        # The bulk request itself failed (rate limited, network error, WAF).
+        # Deliberately does NOT fall back to per-fund requests here: that
+        # would fire 2 requests per fund -- exactly the 60-request burst
+        # bulk fetching exists to avoid -- against an endpoint that just
+        # refused us. The next scheduled run retries with 2 requests, and
+        # every fund keeps its old `last_scraped_date`, so stalest-first
+        # ordering still puts them at the front.
+        message = (
+            "Toplu istek veri dondurmedi (istek limiti, ag hatasi veya WAF). "
+            "Tek fon sorgularina DUSULMEDI; sonraki tur yeniden denenecek."
+        )
+        print(f"[ERROR] [BULK] {message}")
+        return {code: {"status": "error", "message": message} for code in fund_codes}
+
+    print(f"[BULK] Yanitta {len(general_by_fund)} fon var; {len(fund_codes)} tanesi takip ediliyor.")
+
+    # A fund absent from a SUCCESSFUL bulk response is a different case: the
+    # all-funds query worked, this fund just wasn't in it (e.g. a type the
+    # `fonTipi: "YAT"` filter excludes), so a targeted query is worth it.
+    served_by_bulk = [code for code in fund_codes if general_by_fund.get(code)]
+    missing_from_bulk = [code for code in fund_codes if not general_by_fund.get(code)]
+
+    general_maps = {
+        code: build_general_info_map(general_by_fund[code]) for code in served_by_bulk
+    }
+    changed = [
+        code for code in served_by_bulk
+        if general_map_has_changes(database.get(code), general_maps[code])
+    ]
+
+    # --- Distribution (paged), only if something actually changed ------------
+    if changed:
+        distribution_records, session = fetch_bulk_distribution(session, bas_tarih, bit_tarih)
+        distribution_by_fund = group_records_by_fund(distribution_records)
+    else:
+        distribution_by_fund = {}
+        if served_by_bulk:
+            print(
+                f"[BULK] {len(served_by_bulk)} fonun verisi zaten guncel; "
+                "dagilim istegi ve veritabani yazimi atlandi."
+            )
+
+    for fund_code in served_by_bulk:
+        if fund_code not in changed:
+            results[fund_code] = {"status": "success", "inserted": 0, "updated": 0}
+            continue
 
         try:
-            general_payload = build_general_info_payload(fund_code, bas_tarih, bit_tarih)
-            distribution_payload = build_distribution_payload(fund_code, bas_tarih, bit_tarih)
-
-            general_records, session = fetch_endpoint_data(
-                session, GENERAL_INFO_URL, fund_code, general_payload, bas_tarih, bit_tarih
+            merged_records = merge_fund_data(
+                general_maps[fund_code],
+                build_distribution_map(distribution_by_fund.get(fund_code, [])),
             )
-            distribution_records, session = fetch_endpoint_data(
-                session, DISTRIBUTION_URL, fund_code, distribution_payload, bas_tarih, bit_tarih
-            )
-
-            if not distribution_records:
-                # Qualified/restricted funds (e.g. YAS) legitimately don't
-                # publish a portfolio distribution breakdown for some or all
-                # of the queried period; this is expected, not an error.
-                print(
-                    f"[INFO] [{fund_code}] Varlık dağılım verisi boş/bulunamadı "
-                    "(Nitelikli/Kapalı fon olabilir)."
-                )
-
-            if not general_records:
-                # Deliberately does NOT claim the fund code is invalid: the
-                # most common cause in practice is TEFAS rate limiting (HTTP
-                # 429), which is logged in detail by fetch_endpoint_data just
-                # above. Blaming the fund code here sent past debugging in
-                # entirely the wrong direction.
-                message = (
-                    "No general info retrieved -- see the errors logged above "
-                    "(TEFAS rate limit, expired session, invalid fund code, or "
-                    "genuinely no data for this period)."
-                )
-                print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
-                results[fund_code] = {"status": "error", "message": message}
-                continue
-
-            general_map = build_general_info_map(general_records)
-            distribution_map = build_distribution_map(distribution_records)
-            merged_records = merge_fund_data(general_map, distribution_map)
-
             if not merged_records:
                 message = "Merge produced no usable records."
                 print(f"[WARNING] [{fund_code}] {message} Skipping fund.")
                 results[fund_code] = {"status": "error", "message": message}
                 continue
 
-            if distribution_records:
-                # Only flag individual dates here (fund-level gaps were
-                # already reported above); avoids repeating the same
-                # message once per day for a fund with zero distribution
-                # data across the whole queried period.
-                for record in merged_records:
-                    if not record.get("Varliklar"):
-                        print(
-                            f"[INFO] [{fund_code}] {record['Tarih']} için varlık dağılım verisi "
-                            "boş/bulunamadı (Nitelikli/Kapalı fon olabilir)."
-                        )
-
-            inserted_count = 0
-            updated_count = 0
-            for record in merged_records:
-                action = upsert_fund_record(database, fund_code, record)
-                print(f"  [{fund_code}] {record['Tarih']} -> {action}")
-                if action == "inserted":
-                    inserted_count += 1
-                else:
-                    updated_count += 1
-
-            # Marks this fund as freshly scraped regardless of whether it's
-            # shown on the UI or only tracked in the background, so the
-            # 15-day background-tracking cadence (see main.py's lifespan
-            # startup hook) is measured from the most recent successful run.
-            database[fund_code]["_metadata"]["last_scraped_date"] = datetime.now().strftime("%Y-%m-%d")
-            save_database(database)
-            print(
-                f"[SUCCESS] [{fund_code}] {inserted_count} inserted, {updated_count} updated. "
-                f"Saved to {DATABASE_FILE}."
-            )
-            results[fund_code] = {"status": "success", "inserted": inserted_count, "updated": updated_count}
-
+            inserted, updated = store_fund_records(database, fund_code, merged_records)
+            print(f"[SUCCESS] [{fund_code}] {inserted} inserted, {updated} updated.")
+            results[fund_code] = {"status": "success", "inserted": inserted, "updated": updated}
         except Exception as exc:
             print(f"[CRITICAL] [{fund_code}] Unhandled exception: {exc}")
             results[fund_code] = {"status": "error", "message": str(exc)}
 
-        if raw_fund_code != fund_list[-1]:
-            time.sleep(random.uniform(*INTER_FUND_DELAY_RANGE_SECONDS))
+    if missing_from_bulk:
+        fallback_results, session = scrape_funds_individually(
+            session, database, missing_from_bulk, bas_tarih, bit_tarih,
+            reason="fon toplu yanitta yok; hedefli sorguya dusuluyor",
+        )
+        results.update(fallback_results)
 
-    print("\n[SYSTEM] All funds processed. Database is up to date.")
+    _finish_scrape_run(database, results, run_started)
     return results
 
 

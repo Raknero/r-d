@@ -101,15 +101,18 @@ def _load_scan_targets(context="STARTUP"):
       missing), so it stays alive without being re-scraped on every restart.
 
     Returned STALEST FIRST (funds never scraped come first, then oldest
-    `last_scraped_date`), NOT in the database's own insertion order. A
-    scrape run walks this list sequentially, sleeping between funds and
-    saving after each one, so an interrupted run (Ctrl+C, `--reload`
-    restart, crash) always leaves some tail of the list untouched. With
-    insertion order that tail was deterministic -- the most recently ADDED
-    funds -- so a newly added fund could sit stale for days while the
-    funds ahead of it were refreshed on every single restart. Ordering by
-    staleness makes the funds most in need of data the ones that get it
-    first, and the tail rotates instead of starving the same funds.
+    `last_scraped_date`), NOT in the database's own insertion order.
+
+    This ordering mattered enormously when a run sent 2 requests per fund
+    and paused between them: an interrupted or rate-limited run always left
+    a tail unscraped, and in insertion order that tail was deterministic --
+    the most recently ADDED funds -- so a new fund could sit stale for days
+    while the funds ahead of it were refreshed on every restart.
+
+    `scrape_and_update` now serves every fund from one bulk response, so
+    there is no per-fund tail to starve and the order is largely moot. It's
+    kept because it still governs the per-fund fallback path, and because
+    it costs nothing to have the funds most in need of data listed first.
 
     Returns an empty list if the database file is missing, empty, or
     unreadable.
