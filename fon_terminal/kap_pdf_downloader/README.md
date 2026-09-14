@@ -1,7 +1,7 @@
 # KAP PDF Downloader & Parser (Sandbox)
 
 Standalone, isolated module for downloading a Turkish investment fund's
-monthly "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
+"Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
 attachments from KAP (Kamuyu Aydinlatma Platformu / Public Disclosure
 Platform). `TLY` (Tera Portfoy Birinci Serbest Fon) is the fund this
 project was built around and remains explicitly pinned, but as of
@@ -11,17 +11,19 @@ dynamic fund directory -- see "Fund resolution" below.
 This directory lives inside `fon_terminal/` but is intentionally
 decoupled from the rest of the application -- it has its own
 `requirements.txt` and does not import anything from `fon_terminal/`'s
-own modules (`data_scraper.py`, `main.py`, etc.), with exactly one
-documented exception (`build_tefas_power_matrix`, see Step 3 below). The
-three modules here (`kap_downloader.py`, `kap_pdf_parser.py`,
-`kap_delta_engine.py`) only depend on each other and third-party
-packages, so the whole folder can still be lifted into another project as
-a self-contained unit.
+own modules (`data_scraper.py`, `main.py`, etc.), with exactly two
+documented exceptions (`build_tefas_power_matrix`, see Step 3 below, and
+`report_dating.load_tefas_records`, which reuses the same bridge). The
+four modules here (`kap_downloader.py`, `kap_pdf_parser.py`,
+`report_dating.py`, `kap_delta_engine.py`) only depend on each other and
+third-party packages, so the whole folder can still be lifted into
+another project as a self-contained unit.
 
 Beyond the base download/parse pair, this sandbox has grown into a full
 **"Shadow Portfolio" pipeline**: `kap_delta_engine.py` bridges the gap
-between KAP's monthly PDF reports by layering intra-month buy/sell
-disclosures on top of them (Step 0-1), discovers every other fund sharing
+between KAP's PDF reports by layering the buy/sell
+disclosures filed since each report's measured valuation date on top of
+it (Step 0-1), discovers every other fund sharing
 the target fund's portfolio manager (Step 2), collects each of their own
 baselines (Step 2), pulls their daily TEFAS purchasing power (Step 3),
 and proportionally resolves the multi-fund transactions KAP never breaks
@@ -36,8 +38,9 @@ KAP exposes an internal (undocumented) 2-stage backend API:
 1. **Disclosure list** -- `GET /tr/api/disclosure/filter/FILTERYFBF/{company_oid}/{member_oid}/{days_back}`
    returns every disclosure for the fund published in the last `days_back`
    days as JSON, including `disclosureIndex`, `year`, `donem`, `period`,
-   and `attachmentCount`. `donem` is USUALLY the month, but not always --
-   see "Non-month period tags" below.
+   and `attachmentCount`. `donem` is a month for monthly filings and a
+   week number for weekly ones -- it is never treated as a date, see
+   "Weekly reports" below.
 2. **Attachment resolution + download** -- the disclosure's own ID is
    *not* the same as its PDF attachment's file ID (they diverge in the
    trailing hex characters), and there is no separate JSON endpoint that
@@ -55,54 +58,128 @@ this envelope by locating the `%PDF` magic marker in the response and
 keeping everything from there onward, which recovers the original file
 byte-for-byte.
 
-### Non-month period tags: `donem` is not always a month (2026-09-02)
+### Weekly reports: the period label is not a date (2026-09-09)
 
-KAP's `donem` field is undocumented and **cannot be assumed to be a
-month**. TLY's August-2026 "Portfoy Dagilim Raporu"
-(`disclosureIndex=1657116`, published 02.09.2026) was filed with
-`donem=34` and `period="HB"` -- a week-of-year tag -- where all 13 of its
-previous reports used `donem=<month>` with `period="AB"` (monthly).
+**This is the most important behavioral rule in the whole sandbox, so it
+is stated first: a report's period label is metadata, not a date. The
+report's own contents are the only source for when its holdings were
+valued.** Everything below explains why that rule had to be learned the
+hard way.
 
-That raw `34` flowed straight into `date(year, donem, 1)` in
-`find_latest_report` and killed the entire run with
-`ValueError: month must be in 1..12` (and would have hit
-`calendar.monthrange` in `kap_delta_engine` next). The report itself was a
-perfectly ordinary monthly one -- only its metadata tag was unusual: the
-attachment is named `TLY_2026.08.pdf` and page 1 reads "Ağustos-2026"
-with holdings valued 31/08/26.
+Turkish funds became required to publish their "Portfoy Dagilim Raporu"
+**weekly** instead of monthly. KAP's schema was not extended for this --
+the same two fields are simply reused with different meanings:
 
-`normalize_report_period()` now resolves every disclosure's period to a
-real `(year, month)` before anything else touches it, with no extra
-network round-trips:
+| Field | Monthly filing | Weekly filing |
+|---|---|---|
+| `period` | `"AB"` | `"HB"` |
+| `donem` | month (1..12) | ISO week of year (e.g. `34`, `35`) |
 
-1. `donem` already in 1..12 -> trust it as the month.
-2. Otherwise -> derive the month from `publishDate` **minus one month**.
-   KAP publishes a fund's monthly report in the first days of the
-   following month, which holds for every one of TLY's historical
-   filings (`donem=7` published 03.08.2026, `donem=12`/2025 published
-   06.01.2026, ...) and yields exactly August 2026 for the broken record.
-3. Neither available -> the disclosure is skipped with a `[UYARI]` rather
-   than crashing, since a period is required to name the local PDF and to
-   derive the baseline's validity date.
+Neither the attachment filename nor the PDF's own header was updated by
+the filers. TLY's report published **09.09.2026** arrives as
+`donem=35, period="HB"`, is attached as `TLY_2026.08.pdf`, and page 1
+still reads **"Ağustos-2026"** -- while its holdings are valued
+**04.09.2026**. The figures inside are correct; only every label around
+them is wrong.
 
-`DisclosureRecord` keeps the raw values (`raw_donem`, `period_code`)
-alongside the normalized ones, and any normalization is printed as a
-`[BILGI]` line so a corrected period is always traceable to its source.
+#### Two separate bugs this caused
 
-**Second, authoritative check:** `download_latest_report` now resolves the
-attachment *before* cleaning up old local files, then runs
-`_confirm_period_from_attachment` -- the attachment's own display
-filename (`TLY_2026.08.pdf`) is set by the filer next to the document
-itself, so when it disagrees with the disclosure metadata it wins, and
-the correction is logged. Resolving first also means a period correction
-can never delete the file it was about to keep.
+**1. Crash.** A raw `34` flowed into `date(year, donem, 1)` in
+`find_latest_report` -> `ValueError: month must be in 1..12` (and
+`calendar.monthrange` in `kap_delta_engine` next).
 
-Defense in depth on the engine side: `kap_delta_engine.
-baseline_period_end_date` raises a self-explanatory `ValueError` naming
-the offending `donem` (instead of `calendar.monthrange`'s anonymous
-"month must be in 1..12"), `collect_global_baseline` skips just that one
-fund on an unusable period rather than aborting a multi-fund loop, and
-`__main__` exits with a readable message instead of a traceback.
+**2. Silent double-counting -- much worse than the crash.** The first fix
+attempt (`normalize_report_period`, now removed) forced `donem` back into
+a month by falling back to `publishDate` minus one month. That stopped the
+crash and introduced two invisible failures:
+
+- **Reports overwrote each other.** `2026_HB34` and `2026_HB35` are
+  genuinely different weekly reports, but both normalized to
+  `August 2026` and both were named `TLY_2026_08.pdf`, so deduplication
+  dropped one and the file system clobbered the other.
+- **The baseline date was up to a week too early.** "August 2026" implied
+  a 31.08.2026 month end, so the delta window opened 01.09.2026 -- but
+  the PDF's holdings were already valued 04.09.2026. Every disclosure
+  filed 01.09-04.09 was therefore applied **on top of a baseline that
+  already contained it**. Measured on TLY: **8 multi-fund transactions
+  double-counted**, with no error, no warning, and plausible-looking
+  output.
+
+#### The fix: measure the date, never derive it
+
+Period metadata is now preserved exactly as filed and never converted to
+a month. `ReportPeriod` (`kap_downloader.py`) holds `year`, `ordinal`
+(raw `donem`), `code` (raw `period`) and a derived `cadence`, exposing:
+
+- `slug` -> `2026_HB35`, used for the local filename
+  (`TLY_2026_HB35.pdf`), for deduplication, and for old-file cleanup, so
+  two weekly reports can no longer collide.
+- `label` -> `"2026 / 35. hafta (HB)"`, for display only.
+
+"Latest" is decided by **publication instant** (`DisclosureRecord.
+sort_key`, from `publishDate`) rather than by reconstructing a date out
+of the period, so it works identically for weekly, monthly, and any
+future cadence KAP invents.
+
+The attachment filename is no longer treated as authoritative either.
+`_confirm_period_from_attachment` (which used to let the filename
+override KAP's metadata) is gone -- it was itself a source of collisions,
+since two different weekly reports share the filename `TLY_2026.08.pdf`.
+`_note_attachment_period` replaces it and only logs the discrepancy for
+the audit trail.
+
+The actual valuation date comes from `report_dating.py` (see its own
+section below), which reads it out of the PDF's contents. Nothing in the
+pipeline infers a date from a label anymore.
+
+---
+
+## `report_dating.py` -- establishing a report's real valuation date
+
+Once labels are known to be unreliable, the pipeline still needs one hard
+number: **as of which day are these holdings true?** The delta window
+opens the day after it, so being a few days early silently double-counts
+and a few days late silently drops trades.
+
+`resolve_as_of_date(fon_kodu, fingerprint, tefas_records)` derives it from
+evidence only:
+
+1. **Primary signal -- match the PDF against TEFAS history.**
+   `KAPPdfParser.extract_fingerprint` pulls the report's own header
+   figures (Toplam Değer / Net Varlık Değeri, Katılma Payı Sayısı, and
+   the Haftalık/Ay Sonu Pay Fiyatı) and these are matched against the
+   fund's daily TEFAS records. Those three numbers together identify a
+   single trading day essentially uniquely -- a fund's unit price and
+   share count never coincidentally repeat.
+2. **T+1 correction.** TEFAS publishes a day's price on the following
+   day, so the matched TEFAS row is shifted back to the previous recorded
+   business day to get the actual valuation date.
+3. **Cross-check -- the holdings must not contain the future.** The
+   newest "SATIN ALIŞ TARİHİ" in the equities table has to be consistent
+   with the resolved date. This is what exposed the original problem: an
+   "Ağustos-2026" report contained purchases dated after 31.08.
+4. **Refuse rather than guess.** If the figures match no day, match
+   several ambiguously, or the cross-check fails, it raises
+   `ReportDatingError`. The caller skips that fund loudly. Quietly
+   falling back to a month end is precisely the behavior that caused the
+   double-counting, so it is not offered as a fallback.
+
+Verified on consecutive weekly filings, which is what makes the rule
+trustworthy rather than a one-off patch:
+
+| Report | Label says | Measured valuation date |
+|---|---|---|
+| `TLY_2026_HB34` | Ağustos-2026 | 31.08.2026 |
+| `TLY_2026_HB35` | Ağustos-2026 | 04.09.2026 |
+
+Both are labeled the same month; the two dates are 4 days apart, and only
+the measured pair produces a correct, non-overlapping delta window.
+
+TEFAS records are loaded via `load_tefas_records`, which reads the
+sandbox-local `tefas_cache.json` and only re-scrapes when it is stale --
+reusing `data_scraper` through the same `sys.path` bridge documented in
+Step 3 below, so no TEFAS logic is duplicated here and the live app's
+`fund_database.json` is never touched.
 
 ## Usage
 
@@ -112,10 +189,17 @@ from kap_downloader import KAPPdfDownloader
 with KAPPdfDownloader(fon_kodu="TLY") as downloader:
     results = downloader.download_reports(days_back=365)
 
-# Or narrow down to a specific date range without changing how far back
-# KAP itself is queried:
+# Or narrow down to a publication-date range without changing how far
+# back KAP itself is queried. This filters on when KAP PUBLISHED the
+# report, which is the only date its metadata actually carries -- a
+# report's holdings-valuation date is a separate thing entirely, read
+# from the PDF itself (see `report_dating.py`).
 with KAPPdfDownloader(fon_kodu="TLY") as downloader:
-    downloader.download_reports(days_back=730, start_period=(2025, 1), end_period=(2025, 12))
+    downloader.download_reports(
+        days_back=365,
+        published_since=date(2026, 7, 1),
+        published_until=date(2026, 9, 30),
+    )
 ```
 
 Or run it directly:
@@ -126,7 +210,10 @@ python kap_downloader.py
 ```
 
 PDFs are saved into a `tly_pdfs/` folder (created automatically) as
-`TLY_{YEAR}_{MONTH:02d}.pdf`, e.g. `TLY_2026_06.pdf`.
+`TLY_{ReportPeriod.slug}.pdf` -- i.e. `TLY_2026_AB06.pdf` for the 6th
+month's monthly filing and `TLY_2026_HB35.pdf` for the 35th week's weekly
+one. The cadence code is part of the name on purpose: without it, a
+weekly report would overwrite the monthly one covering the same month.
 
 ## Fund resolution: static override + dynamic KAP directory (2026-07-30)
 
@@ -225,12 +312,18 @@ from kap_pdf_parser import KAPPdfParser
 parser = KAPPdfParser()
 
 # Single file
-holdings = parser.parse_file("tly_pdfs/TLY_2026_03.pdf")
+holdings = parser.parse_file("tly_pdfs/TLY_2026_HB35.pdf")
 # {"ALKLC": 731256.0, "CWENE": 3000000.0, ...}
 
-# Whole directory, keyed by period parsed from each filename
+# Whole directory, keyed by the period slug parsed from each filename
 history = parser.parse_directory("tly_pdfs")
-# {"2026_01": {...}, "2026_02": {...}, "2026_03": {...}}
+# {"2026_AB06": {...}, "2026_AB07": {...}, "2026_HB35": {...}}
+
+# When the holdings' actual valuation date matters (it always does for
+# delta math), read it from the PDF rather than from the key above:
+fingerprint = parser.extract_fingerprint("tly_pdfs/TLY_2026_HB35.pdf")
+# fingerprint.declared_period_label == "Ağustos-2026"  <- do NOT trust
+# fingerprint.unit_price / .share_count / .total_value <- match vs TEFAS
 ```
 
 Or run it directly (parses everything in `tly_pdfs/` and pretty-prints the
@@ -283,7 +376,7 @@ file gets extended with, in order:
    that `resolve_multi_fund_deltas` was able to estimate proportionally
    (see Step 4 below).
 5. **"Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti)"** -- baseline + (2)
-   + (4), reshaped ticker-by-ticker with month-to-date % change, BIST
+   + (4), reshaped ticker-by-ticker with since-baseline % change, BIST
    price/weight columns when available, Chart.js visuals above the table,
    and a click-to-expand day-by-day transaction history (see its own
    section below).
@@ -316,7 +409,7 @@ per ticker:
 | Oransal Tahmini Delta Lot | Net (signed) sum of every `proportionally_resolved` entry for this ticker. |
 | İşlem Tarihçesi | Click-to-expand `<details>` list of every INDIVIDUAL dated entry behind the two delta columns above (see below). |
 | Güncel Tahmini Lot | Başlangıç + Kesinleşen + Oransal. |
-| Ay Başından Beri Lot Değişimi (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, matte emerald if positive, matte brick-red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). **This is month-to-date vs the last PDF baseline only** -- it resets when the next monthly KAP PDF becomes the new baseline; it is not a long-term trend. |
+| Taban Tarihinden Beri Lot Değişimi (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, matte emerald if positive, matte brick-red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). **This covers only the span since the baseline PDF's measured valuation date** -- it resets when the next KAP PDF becomes the new baseline; it is not a long-term trend. |
 | Güncel Fiyat | Latest BIST close from yfinance (`TICKER.IS`), or `-` if unavailable. |
 | Güncel Ağırlık (%) | `(Güncel Tahmini Lot × Güncel Fiyat) / fon AUM * 100` when both price and AUM exist; otherwise `-`. |
 
@@ -325,12 +418,22 @@ descending (largest portfolio weight first); tickers without a computable
 weight fall to the end, ordered by absolute lot change. Without prices,
 sorting falls back to absolute lot-change magnitude.
 
-**Month-to-date caveat (UI, 2026-08-06):** the HTML section renders a bold
-warning above the table stating that lot-change percentages do **not**
-reflect long-term investment trend -- only activity since the last PDF
-period end -- and reset when that PDF rolls forward. Column naming
-("Ay Başından Beri Lot Değişimi (%)") matches that semantics; the
-calculation engine is unchanged.
+**Short-window caveat (UI, 2026-08-06; re-dated 2026-09-09):** the HTML
+section renders a bold warning above the table stating that lot-change
+percentages do **not** reflect long-term investment trend -- only activity
+since the baseline PDF's valuation date -- and reset when that PDF rolls
+forward.
+
+The original wording said "ay başından beri" / "ay sonu" and the column
+was named "Ay Başından Beri Lot Değişimi (%)", which stopped being true
+the moment KAP went weekly: the window is now often 4-7 days, not a month.
+Both were renamed to **"Taban Tarihinden Beri Lot Değişimi (%)"**, and the
+warning now prints the MEASURED valuation date it was computed from
+(`delta_report["baseline_as_of"]`, e.g. "04.09.2026") plus an explicit
+note that the period label is not a date. When `baseline_as_of` is absent
+(an older caller), the copy falls back to naming the baseline generically
+rather than printing a date the pipeline never established. The
+calculation engine is unchanged -- this is wording and provenance only.
 
 **Chart.js visuals (UI, 2026-08-06):** above the evolution table,
 `_render_evolution_charts` injects a `const chartData = ...` payload
@@ -339,10 +442,11 @@ engine recalculation) and two canvases via Chart.js CDN:
 
 1. **Güncel Ağırlık Dağılımı** (doughnut) -- top 10 tickers by weight;
    remainder collapsed into a single "Diğerleri" slice.
-2. **Ay Başından Beri Lot Değişimi (%)** (bar) -- only tickers with a
-   non-zero month-to-date %; buys emerald, sells brick-red. If every
+2. **Taban Tarihinden Beri Lot Değişimi (%)** (bar) -- only tickers with a
+   non-zero since-baseline %; buys emerald, sells brick-red. If every
    change is zero, an HTML placeholder replaces the bar canvas:
-   "Ay başından beri yeni işlem (delta) bulunmamaktadır."
+   "Taban raporunun veri tarihinden beri yeni işlem (delta)
+   bulunmamaktadır."
 
 Chart chrome (legend/ticks/grid) follows the same terminal dark palette as
 the rest of the report (soft slate text, low-opacity grid lines).
@@ -367,12 +471,38 @@ Güncel/% figures next to it, which are computed exactly as before.
 
 ---
 
-## `kap_delta_engine.py` -- bridging the gap between monthly reports
+## `kap_delta_engine.py` -- bridging the gap between reports
 
-`KAPPdfParser` gives an exact holdings snapshot, but only once a month
-(whenever KAP publishes the next "Portfoy Dagilim Raporu"). `KAPDeltaEngine`
-keeps that snapshot current in between reports by layering KAP's
-intra-month buy/sell disclosures on top of it.
+`KAPPdfParser` gives an exact holdings snapshot, but only as often as KAP
+publishes the next "Portfoy Dagilim Raporu" (monthly historically, weekly
+since 2026-09). `KAPDeltaEngine` keeps that snapshot current in between
+reports by layering KAP's buy/sell disclosures on top of it.
+
+### Where the delta window starts: `date_baseline_report`
+
+The single most failure-prone number in this module is the delta window's
+first day, because both directions of error are silent: too early
+re-applies trades the PDF already contains, too late drops trades
+entirely.
+
+`date_baseline_report(fon_kodu, pdf_path, tefas_records)` produces it by
+delegating to `report_dating.resolve_as_of_date` (see its section above)
+and returning an `AsOfResolution` whose `delta_start` is simply
+`as_of + 1 day` -- the PDF is complete through its valuation date, so the
+deltas start the day after.
+
+This replaced `baseline_period_end_date()` /
+`baseline_period_to_delta_start()`, which computed the same thing from the
+period label via `calendar.monthrange`. That was correct only while every
+report was monthly; for a weekly report labeled with a month it produced a
+start date up to a week too early, and double-counted every disclosure in
+between (measured: 8 transactions on TLY).
+
+If the date cannot be established, `ReportDatingError` propagates: a
+single fund is skipped with a `[UYARI]` inside `collect_global_baseline`,
+and `__main__` exits with an explanation instead of continuing on a
+guessed date. Deliberately chosen over a month-end fallback, since that
+fallback is exactly what caused the double-counting.
 
 ### Architecture
 
@@ -387,7 +517,7 @@ endpoint entirely -- see "Endpoint correction" below for why.
    Alim Satim Bildirimi"` entries whose `relatedStocks` field mentions
    the target fund code, published inside the requested date window.
 2. **Detail page parsing** -- fetches the same `/tr/Bildirim/{disclosureIndex}`
-   page `KAPPdfDownloader` reads for the monthly report's PDF link, but
+   page `KAPPdfDownloader` reads for the allocation report's PDF link, but
    parses its inline `tbl_oda-10400_Shares-Transaction-Notification`
    table with BeautifulSoup instead: a GWT-rendered taxonomy table where
    every column is duplicated Turkish-then-English with no separator
@@ -400,13 +530,23 @@ endpoint entirely -- see "Endpoint correction" below for why.
 ### Usage
 
 ```python
+from datetime import date
 from kap_pdf_parser import KAPPdfParser
-from kap_delta_engine import KAPDeltaEngine
+from kap_delta_engine import KAPDeltaEngine, date_baseline_report
+from report_dating import load_tefas_records
 
-baseline = KAPPdfParser().parse_file("tly_pdfs/TLY_2026_06.pdf")
+pdf_path = "tly_pdfs/TLY_2026_HB35.pdf"
+baseline = KAPPdfParser().parse_file(pdf_path)
+
+# Never hand-pick `start_date` off the period label -- measure it.
+dating = date_baseline_report("TLY", pdf_path, load_tefas_records(["TLY"])["TLY"])
 
 with KAPDeltaEngine(fon_kodu="TLY") as engine:
-    updated, resolved, unresolved = engine.apply_delta(baseline, start_date="2026-06-01", end_date="2026-07-28")
+    updated, resolved, unresolved = engine.apply_delta(
+        baseline,
+        start_date=dating.delta_start.isoformat(),   # 2026-09-05, not 2026-09-01
+        end_date=date.today().isoformat(),
+    )
 
 # `updated` only reflects disclosures that named TLY exclusively.
 # `resolved` is one ResolvedDelta per ticker actually merged into `updated`.
@@ -426,7 +566,7 @@ python kap_delta_engine.py
 ### Endpoint correction (2026-07-28)
 
 The first version of `_fetch_delta_disclosures` queried the same
-`FILTERYFBF` endpoint `KAPPdfDownloader` uses for the monthly report,
+`FILTERYFBF` endpoint `KAPPdfDownloader` uses for the allocation report,
 which only ever returns `"Portfoy Dagilim Raporu"` entries for `TLY` --
 it returned zero buy/sell notices. **That was a wrong endpoint choice,
 not evidence that the fund doesn't publish them.** `FILTERYFBF` is
@@ -517,10 +657,19 @@ downloads that fund's OWN most recently published PDF into its own
 result is merged into one dict:
 
 ```python
-global_baseline, baseline_periods = collect_global_baseline(related_funds)
+global_baseline, baseline_datings = collect_global_baseline(related_funds)
 # global_baseline:  {"TLY": {"ALKLC": 731256.0, ...}, "DOH": {...}, ...}
-# baseline_periods: {"TLY": (2026, 6), "DOH": (2026, 5), ...}  # funds can legitimately differ here
+# baseline_datings: {"TLY": AsOfResolution(as_of=date(2026, 9, 4), ...), ...}
 ```
+
+The second return value used to be `baseline_periods`, a
+`{fon: (year, donem)}` map of KAP period labels. It is now
+`{fon: AsOfResolution}` -- each fund's MEASURED valuation date plus the
+evidence behind it (see `report_dating.py`), because the label alone
+cannot bound a delta window. Funds legitimately differ here in both
+report period AND valuation date: in a verified run TLY/DOH/TMV resolved
+to 04.09.2026 from weekly filings while THF resolved to 31.08.2026 from a
+monthly one, all in the same pass.
 
 **"Date Lag" fix (2026-07-31):** the first version of this function took a
 single, externally-supplied `baseline_period` and forced every fund onto
@@ -532,17 +681,20 @@ publish on different schedules, so forcing a shared period meant any fund
 whose true latest report was newer than that period silently lost every
 month in between. The fix: each fund now calls `KAPPdfDownloader.
 download_latest_report()` (see that module's own section above), which
-queries KAP directly, converts every candidate disclosure's NORMALIZED
-`(year, donem)` into a real `date()` object, and takes the genuine
-`max()` -- then deletes any other PDF already sitting in that fund's
-folder so a stale file can never be parsed alongside the fresh one. The
-second return value, `baseline_periods`, records exactly which `(year,
-donem)` ended up being used per fund, since they are no longer forced to
-match.
+queries KAP directly and takes the report with the newest PUBLICATION
+instant -- then deletes any other PDF already sitting in that fund's
+folder so a stale file can never be parsed alongside the fresh one.
+
+That "newest publication instant" ordering is itself part of the
+2026-09-09 weekly-report fix: it previously sorted by a `date()` rebuilt
+from the normalized `(year, donem)`, which cannot order two reports whose
+labels collapse to the same month (`HB34` and `HB35` both said August
+2026). `publishDate` is unambiguous for every cadence.
 
 **Never crashes on a bad fund**, by design: a fund with no registered/
-resolvable KAP identity, a failed/empty download, an unusable period tag
-(see "Non-month period tags" above), or an empty parse result are all
+resolvable KAP identity, a failed/empty download, a valuation date that
+cannot be established from the PDF (`ReportDatingError` -- see
+`report_dating.py` above), or an empty parse result are all
 caught individually, logged as `[UYARI]`, and simply omitted from the
 result -- one bad fund never aborts the loop. Logs a final summary
 (`X/Y fon basariyla toplandi, Z benzersiz hisse kodu bulundu`).
@@ -562,7 +714,7 @@ fund actually has to deploy, day by day. `build_tefas_power_matrix
 (fund_codes, days_back=30)` (module-level, called with the FULL discovered
 fund list from step 1 -- not just the subset that also had a KAP PDF
 baseline, since a fund like `T3B`/`TGI` can have daily TEFAS data with no
-monthly report at all) pulls the last `days_back` days of TEFAS AUM
+allocation report at all) pulls the last `days_back` days of TEFAS AUM
 ("Toplam Deger") and portfolio distribution for every fund via this
 project's existing TEFAS scraper, then computes a daily "Aktif Güç"
 (active purchasing power) figure per fund:

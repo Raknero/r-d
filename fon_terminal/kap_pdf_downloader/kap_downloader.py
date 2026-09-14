@@ -2,9 +2,17 @@
 kap_downloader.py
 
 Standalone, self-contained module for downloading a Turkish investment
-fund's monthly "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
+fund's "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
 attachments from KAP (Kamuyu Aydinlatma Platformu / Public Disclosure
 Platform).
+
+Cadence note (2026-09-14): these reports used to be strictly monthly, and
+are now filed WEEKLY by a growing share of funds -- both cadences appear
+side by side, per fund, distinguished by KAP's `period` code ("AB"
+monthly / "HB" weekly). This module therefore identifies a report by
+KAP's own period metadata (see `ReportPeriod`) and never converts it into
+a month. A report's actual as-of date is not this module's business at
+all; it is established from the document's contents by `report_dating`.
 
 This module lives in its own sandbox and has no dependency on any other
 part of the host project; it only needs the third-party `requests`
@@ -134,72 +142,104 @@ def _parse_kap_publish_date(publish_date: str) -> Optional[datetime]:
     return None
 
 
-def normalize_report_period(
+# KAP's own `period` codes on "Portfoy Dagilim Raporu" filings. This field
+# -- not `donem` -- is what actually states a report's cadence, and it is
+# the one piece of KAP period metadata that has never been observed wrong.
+PERIOD_CODE_MONTHLY = "AB"  # Aylık Bildirim
+PERIOD_CODE_WEEKLY = "HB"   # Haftalık Bildirim
+
+CADENCE_BY_PERIOD_CODE = {
+    PERIOD_CODE_MONTHLY: "AYLIK",
+    PERIOD_CODE_WEEKLY: "HAFTALIK",
+}
+
+# Stand-in code for a filing that carries no `period` at all, so a period
+# slug can still be formed without inventing a cadence.
+PERIOD_CODE_UNKNOWN = "XX"
+
+
+@dataclass(frozen=True)
+class ReportPeriod:
+    """A disclosure's period EXACTLY as KAP filed it -- deliberately not
+    converted into a month.
+
+    Why this replaced the old month-normalizing logic (2026-09-14): funds
+    moved to WEEKLY portfolio disclosure, so `donem` is now a week number
+    whenever `period` is "HB" (TLY filed `donem=34` for the report
+    published 02.09.2026 and `donem=35` for 09.09.2026). The previous
+    `normalize_report_period()` forced such a tag into a month by taking
+    "publish month - 1", which produced August for BOTH -- collapsing two
+    distinct weekly reports onto one period, one dedup key and one local
+    filename, so the older of the two was silently discarded and the two
+    files overwrote each other on disk.
+
+    Worse, that fabricated month then became the baseline's validity date
+    (month end, 31.08.2026) even though the reports' holdings are from 04
+    September -- see `report_dating`, which is now the ONLY thing allowed
+    to determine a report's date, and does so from the document's data
+    rather than from any label.
+
+    So this type has one job: identify WHICH disclosure a file came from,
+    uniquely and without fabrication. `slug` is that identity (e.g.
+    "2026_HB35", "2026_AB07") and is used for local filenames and parser
+    keys. It is NOT a date and must never be treated as one.
+    """
+
+    year: int
+    ordinal: int      # KAP's raw `donem`: a month when code is "AB", a week number when "HB"
+    code: str         # KAP's raw `period` code, upper-cased
+    cadence: Optional[str] = None   # "AYLIK"/"HAFTALIK" when the code is recognized
+
+    @property
+    def slug(self) -> str:
+        """Filename/dict-key-safe identity, e.g. "2026_HB35"."""
+        return f"{self.year}_{self.code}{self.ordinal:02d}"
+
+    @property
+    def label(self) -> str:
+        """Human-readable form for logs, e.g. "2026 / 35. hafta (HB)"."""
+        if self.code == PERIOD_CODE_WEEKLY:
+            return f"{self.year} / {self.ordinal}. hafta (HB)"
+        if self.code == PERIOD_CODE_MONTHLY:
+            return f"{self.year} / {self.ordinal:02d}. ay (AB)"
+        return f"{self.year} / dönem {self.ordinal} ({self.code})"
+
+
+def describe_report_period(
     year: Optional[int],
     donem: Optional[int],
-    publish_date: str = "",
     period_code: Optional[str] = None,
-) -> Optional[Tuple[int, int]]:
-    """Resolves a disclosure's `(year, donem)` metadata into a REAL
-    `(year, month)` pair with `month` guaranteed to be in 1..12.
+) -> Optional[ReportPeriod]:
+    """Wraps KAP's raw `(year, donem, period)` metadata in a
+    `ReportPeriod` without interpreting `donem` as a month (see that
+    class for why interpreting it was the bug).
 
-    Why this exists (2026-09-02): KAP's `donem` field is documented
-    nowhere and is NOT always a month. TLY's August-2026 "Portfoy
-    Dagilim Raporu" (disclosureIndex=1657116, published 02.09.2026) was
-    filed with `donem=34` and `period="HB"` -- a week-of-year tag --
-    instead of the `donem=8`/`period="AB"` (monthly) every previous
-    report used. The document itself is unambiguously the monthly August
-    report: its attachment is named "TLY_2026.08.pdf" and its first page
-    reads "Ağustos-2026" with holdings valued 31/08/26. Feeding that raw
-    34 into `date(year, donem, 1)` / `calendar.monthrange` raised
-    "ValueError: month must be in 1..12" and killed the entire run.
-
-    Resolution order (no extra network round-trips):
-
-    1. `donem` already in 1..12 -> trust it as the month (every report
-       filed before this quirk, and every correctly-filed one after).
-    2. Otherwise -> derive the month from `publish_date` minus one month.
-       KAP publishes a fund's monthly report in the first days of the
-       FOLLOWING month, which holds for every one of TLY's historical
-       filings (donem=7 published 03.08.2026, donem=12/2025 published
-       06.01.2026, ...) and yields exactly August 2026 for the broken
-       `donem=34` record above.
-    3. Neither available -> None, so the caller can skip the record with
-       a warning rather than crash (a period is required to name the
-       local PDF and to derive the baseline's validity date).
-
-    `period_code` (KAP's own `period` field, e.g. "AB" monthly / "HB"
-    weekly) is accepted for logging/traceability only -- the numeric
-    range check above is what actually decides, so an unseen future code
-    can never break this.
+    Returns None only when `year`/`donem` are missing or non-numeric, so
+    the caller can skip that disclosure with a warning. Unlike the
+    function this replaced, it can never raise and never needs
+    `publish_date` to guess a month -- an unrecognized future `period`
+    code simply yields `cadence=None`, which callers treat as "cadence
+    unknown" rather than as an error.
     """
-    if year is None:
+    if year is None or donem is None:
         return None
-
     try:
-        year_int = int(year)
+        year_int, ordinal_int = int(year), int(donem)
     except (TypeError, ValueError):
         return None
-
-    if donem is not None:
-        try:
-            donem_int = int(donem)
-        except (TypeError, ValueError):
-            donem_int = None
-        if donem_int is not None and 1 <= donem_int <= 12:
-            return year_int, donem_int
-
-    published = _parse_kap_publish_date(publish_date)
-    if published is None:
+    if ordinal_int < 0:
         return None
 
-    # Reported month = publish month - 1 (December rolls back a year).
-    month = published.month - 1
-    reported_year = published.year
-    if month == 0:
-        month = 12
-        reported_year -= 1
-    return reported_year, month
+    code = (period_code or "").strip().upper() or PERIOD_CODE_UNKNOWN
+    if not code.isalpha() or len(code) > 3:
+        code = PERIOD_CODE_UNKNOWN
+
+    return ReportPeriod(
+        year=year_int,
+        ordinal=ordinal_int,
+        code=code,
+        cadence=CADENCE_BY_PERIOD_CODE.get(code),
+    )
 
 
 @dataclass
@@ -207,31 +247,32 @@ class DisclosureRecord:
     """One "Portfoy Dagilim Raporu" entry from KAP's disclosure filter
     API, trimmed down to only the fields this module needs.
 
-    `year`/`donem` are the NORMALIZED period (`donem` always 1..12, see
-    `normalize_report_period`); `raw_donem`/`period_code` keep whatever
-    KAP actually sent so a normalization can always be traced back to
-    its source values.
+    `period` carries KAP's own period metadata verbatim (see
+    `ReportPeriod`); there is deliberately no month field, because a
+    weekly filing has no month to speak of. `published_at` is the parsed
+    `publish_date`, which is what orders records -- it is the only
+    period-independent ordering signal KAP exposes that has not been
+    observed mislabelled.
     """
 
     disclosure_id: str
     disclosure_index: int
-    year: int
-    donem: int
+    period: ReportPeriod
     attachment_count: int
     publish_date: str
-    raw_donem: Optional[int] = None
-    period_code: Optional[str] = None
+    published_at: Optional[datetime] = None
 
     @property
-    def period_was_normalized(self) -> bool:
-        """True when KAP's own `donem` wasn't a usable month and the
-        period had to be derived from `publish_date` instead."""
-        return self.raw_donem != self.donem
+    def sort_key(self) -> Tuple[datetime, int]:
+        """Newest-first ordering key: publication instant, then
+        `disclosure_index` to break ties deterministically."""
+        return (self.published_at or datetime.min, self.disclosure_index)
 
 
 class KAPPdfDownloader:
-    """Downloads monthly "Portfoy Dagilim Raporu" (Portfolio Allocation
-    Report) PDF attachments for a tracked KAP-listed fund.
+    """Downloads "Portfoy Dagilim Raporu" (Portfolio Allocation Report)
+    PDF attachments for a tracked KAP-listed fund, on whichever cadence
+    the fund files them (see this module's docstring).
 
     The pipeline is a 2-stage process against KAP's internal (undocumented)
     backend API:
@@ -513,9 +554,17 @@ class KAPPdfDownloader:
     def _fetch_disclosure_list(self, days_back: int) -> List[DisclosureRecord]:
         """Calls KAP's disclosure filter API and returns every
         "Portfoy Dagilim Raporu" entry that has at least one attachment,
-        deduplicated so only the most-recently-published report per
-        (year, donem) is kept (KAP occasionally republishes a corrected
-        report for a period that was already reported).
+        deduplicated so only the most-recently-published filing per
+        PERIOD SLUG is kept (KAP occasionally republishes a corrected
+        report for a period it already reported).
+
+        Deduplicating on `period.slug` -- which includes KAP's `period`
+        code and raw `donem` -- rather than on a derived (year, month) is
+        what keeps consecutive WEEKLY reports separate: TLY's 02.09.2026
+        and 09.09.2026 filings are `2026_HB34` and `2026_HB35`, but both
+        used to normalize to (2026, 8), so the earlier one was silently
+        dropped here and never seen again (verified 2026-09-14: KAP
+        returned 5 disclosures, this method emitted 4).
         """
         url = self.BASE_URL + self.FILTER_ENDPOINT.format(
             company_oid=self.fund_config["company_oid"],
@@ -539,7 +588,7 @@ class KAPPdfDownloader:
             print(f"[HATA] [{self.fon_kodu}] Beklenmeyen API yanit formati (liste degil).")
             return []
 
-        best_by_period: Dict[Tuple[int, int], DisclosureRecord] = {}
+        best_by_period: Dict[str, DisclosureRecord] = {}
         for item in payload:
             basic = item.get("disclosureBasic") if isinstance(item, dict) else None
             if not basic:
@@ -552,79 +601,76 @@ class KAPPdfDownloader:
                 continue
 
             year, donem, disclosure_index = basic.get("year"), basic.get("donem"), basic.get("disclosureIndex")
-            if year is None or disclosure_index is None:
+            if disclosure_index is None:
                 continue
 
             publish_date = basic.get("publishDate") or ""
             period_code = basic.get("period")
 
-            # KAP's `donem` is not always a month (see
-            # `normalize_report_period`): a week-of-year tag would
-            # otherwise reach `date()`/`calendar.monthrange` and crash.
-            normalized = normalize_report_period(
-                year=year, donem=donem, publish_date=publish_date, period_code=period_code
-            )
-            if normalized is None:
+            period = describe_report_period(year=year, donem=donem, period_code=period_code)
+            if period is None:
                 print(
-                    f"[UYARI] [{self.fon_kodu}] Dönem bilgisi çözümlenemedi "
+                    f"[UYARI] [{self.fon_kodu}] Dönem bilgisi okunamadi "
                     f"(disclosureIndex={disclosure_index}, year={year!r}, donem={donem!r}, "
-                    f"period={period_code!r}, publishDate={publish_date!r}); bu bildirim atlaniyor."
+                    f"period={period_code!r}); bu bildirim atlaniyor."
                 )
                 continue
 
-            normalized_year, normalized_month = normalized
             record = DisclosureRecord(
                 disclosure_id=basic.get("disclosureId"),
                 disclosure_index=disclosure_index,
-                year=normalized_year,
-                donem=normalized_month,
+                period=period,
                 attachment_count=attachment_count,
                 publish_date=publish_date,
-                raw_donem=donem,
-                period_code=period_code,
+                published_at=_parse_kap_publish_date(publish_date),
             )
 
-            if record.period_was_normalized:
+            if period.cadence is None:
                 print(
-                    f"[BILGI] [{self.fon_kodu}] KAP dönem etiketi aya çevrildi: "
-                    f"donem={donem!r} (period={period_code!r}) -> "
-                    f"{normalized_month:02d}/{normalized_year} "
-                    f"(kaynak: publishDate={publish_date!r}, disclosureIndex={disclosure_index})."
+                    f"[UYARI] [{self.fon_kodu}] KAP dönem kodu taninmiyor "
+                    f"(period={period_code!r}, donem={donem!r}, disclosureIndex={disclosure_index}); "
+                    f"ritim bilinmiyor olarak isaretlendi. Rapor tarihi yine de icerikten "
+                    f"belirlenecek (report_dating), bu yuzden islem durmuyor."
                 )
 
-            period_key = (record.year, record.donem)
-            existing = best_by_period.get(period_key)
-            if existing is None or record.publish_date > existing.publish_date:
-                best_by_period[period_key] = record
+            existing = best_by_period.get(period.slug)
+            if existing is None or record.sort_key > existing.sort_key:
+                best_by_period[period.slug] = record
 
-        # Sorted NEWEST-FIRST (descending) rather than the API's own,
-        # undocumented/occasionally-paginated ordering -- see
-        # `find_latest_report`, which additionally re-derives the true
-        # maximum via `date()` objects rather than trusting this order
-        # alone (belt-and-suspenders against a "Date Lag" bug like the one
-        # fixed 2026-07-31, where a stale local PDF silently stood in for
-        # the fund's actual latest published report).
-        records = sorted(best_by_period.values(), key=lambda r: (r.year, r.donem), reverse=True)
+        # Sorted NEWEST-FIRST by publication instant. KAP's API documents
+        # no ordering/pagination guarantee, and no period field can be
+        # used for this anymore: comparing a weekly `donem` (a week
+        # number) against a monthly one (a month) is meaningless, and both
+        # cadences appear in the same list during the transition.
+        records = sorted(best_by_period.values(), key=lambda r: r.sort_key, reverse=True)
+        cadence_summary = ", ".join(
+            f"{r.period.slug}({r.publish_date[:10]})" for r in records[:6]
+        )
         print(
             f"[BILGI] [{self.fon_kodu}] {len(records)} adet '{self.REPORT_TITLE}' bulundu "
-            f"(son {days_back} gun icinde)."
+            f"(son {days_back} gun icinde){': ' + cadence_summary if cadence_summary else ''}."
         )
         return records
 
     def find_latest_report(self, days_back: int = 365) -> Optional[DisclosureRecord]:
-        """Explicitly determines the SINGLE most recently published
-        "Portfoy Dagilim Raporu" for this fund, by converting every
-        candidate disclosure's NORMALIZED (year, donem) into a real
-        `date(year, donem, 1)` object and taking `max()` over them --
-        rather than trusting `_fetch_disclosure_list`'s own sort order
-        (which is already newest-first, but KAP's underlying API has no
-        documented pagination/ordering guarantee, so re-deriving the true
-        maximum here costs nothing and removes any doubt).
+        """Returns the SINGLE most recently published "Portfoy Dagilim
+        Raporu" for this fund, chosen by publication instant (see
+        `DisclosureRecord.sort_key`).
 
-        Safe by construction: `_fetch_disclosure_list` only ever emits
-        records whose `donem` is a real month (1..12) -- see
-        `normalize_report_period` for the week-tag quirk this protects
-        against -- so `date()` here can no longer raise.
+        Publication order is used because no period field can order these
+        records anymore: during the monthly-to-weekly transition a fund's
+        list mixes "AB" filings (whose `donem` is a month) with "HB" ones
+        (whose `donem` is a week number), and the two scales are not
+        comparable. The previous implementation built `date(year, donem,
+        1)` from a fabricated month, which both crashed on week tags and
+        ranked two different weekly reports as identical.
+
+        Note this deliberately answers "most recently PUBLISHED", not
+        "most recent DATA" -- those can differ if a filer republishes an
+        old period. The downloaded report's real as-of date is established
+        separately and from its contents (`report_dating`), so a
+        surprising date surfaces there as a dated baseline rather than as
+        a silent one.
 
         Returns None (never raises) if no report was found at all within
         `days_back` days.
@@ -632,15 +678,20 @@ class KAPPdfDownloader:
         records = self._fetch_disclosure_list(days_back)
         if not records:
             return None
-        return max(records, key=lambda r: (date(r.year, r.donem, 1), r.publish_date))
+        return max(records, key=lambda r: r.sort_key)
 
-    def _clean_old_reports(self, keep_period: Tuple[int, int]) -> None:
-        """Deletes every "{fon_kodu}_YYYY_MM.pdf" file already sitting in
-        `self.output_dir` whose (year, donem) period is NOT `keep_period`,
-        so a stale older-month report left over from a previous run can
-        never linger alongside (or be mistaken for) the freshly downloaded
-        latest one -- this is what `KAPPdfParser.parse_directory` would
-        otherwise pick up right alongside the new file.
+    def _clean_old_reports(self, keep_slug: str) -> None:
+        """Deletes every other "{fon_kodu}_*.pdf" already sitting in
+        `self.output_dir` whose period slug is NOT `keep_slug`, so a stale
+        report left over from a previous run can never linger alongside
+        (or be mistaken for) the freshly downloaded latest one -- this is
+        what `KAPPdfParser.parse_directory` would otherwise pick up right
+        alongside the new file.
+
+        Matches any slug shape, which also cleans up files written by the
+        pre-2026-09-14 "{fon_kodu}_YYYY_MM.pdf" scheme -- those are
+        actively harmful to leave behind, since a legacy "TLY_2026_08.pdf"
+        is a WEEKLY report misfiled under a month.
 
         Never raises: a file that can't be removed is logged as "[UYARI]"
         and left in place rather than aborting the run.
@@ -648,13 +699,10 @@ class KAPPdfDownloader:
         if not os.path.isdir(self.output_dir):
             return
 
-        pattern = re.compile(rf"^{re.escape(self.fon_kodu)}_(\d{{4}})_(\d{{2}})\.pdf$", re.IGNORECASE)
+        pattern = re.compile(rf"^{re.escape(self.fon_kodu)}_(?P<slug>.+)\.pdf$", re.IGNORECASE)
         for filename in os.listdir(self.output_dir):
             match = pattern.match(filename)
-            if not match:
-                continue
-            period = (int(match.group(1)), int(match.group(2)))
-            if period == keep_period:
+            if not match or match.group("slug").upper() == keep_slug.upper():
                 continue
 
             filepath = os.path.join(self.output_dir, filename)
@@ -665,44 +713,45 @@ class KAPPdfDownloader:
                 print(f"[UYARI] [{self.fon_kodu}] Eski rapor silinemedi ({filename}): {exc}")
 
     # Matches the "{YYYY}{sep}{MM}" period an attachment's own display
-    # filename carries, e.g. "TLY_2026.08.pdf" / "TLY_2026_08.pdf".
+    # filename carries, e.g. "TLY_2026.08.pdf".
     _ATTACHMENT_PERIOD_PATTERN = re.compile(r"(20\d{2})[._\-](0[1-9]|1[0-2])(?!\d)")
 
-    def _confirm_period_from_attachment(
-        self, record: DisclosureRecord, remote_filename: str
-    ) -> Tuple[int, int]:
-        """Cross-checks a disclosure's normalized `(year, donem)` against
-        the period embedded in the attachment's OWN display filename
-        (e.g. "TLY_2026.08.pdf" -> 2026/08) and returns whichever should
-        be trusted.
+    def _note_attachment_period(self, record: DisclosureRecord, remote_filename: str) -> None:
+        """Logs -- for the audit trail only -- the period the attachment's
+        own display filename claims.
 
-        The document's filename is set by the filer alongside the report
-        itself, so when it disagrees with the disclosure's `donem`
-        metadata it is the better source -- this is precisely what
-        identified TLY's `donem=34`/`period="HB"` filing as the August
-        2026 monthly report. A filename with no recognizable period (or
-        one that agrees) leaves the normalized period untouched.
+        This used to OVERRIDE the disclosure's period on the theory that
+        the filer names the document more carefully than it tags the
+        filing. That theory is now disproved: both of TLY's weekly
+        reports (`2026_HB34`, published 02.09.2026, and `2026_HB35`,
+        published 09.09.2026) ship as "TLY_2026.08.pdf", so the filename
+        is not merely wrong about the month -- it cannot even tell two
+        different reports apart. It is kept as an observation because a
+        mismatch is a useful signal that a filer is still labelling
+        weekly reports with monthly names.
         """
         match = self._ATTACHMENT_PERIOD_PATTERN.search(remote_filename or "")
         if not match:
-            return record.year, record.donem
+            return
 
         file_year, file_month = int(match.group(1)), int(match.group(2))
-        if (file_year, file_month) == (record.year, record.donem):
-            return record.year, record.donem
+        if record.period.code == PERIOD_CODE_MONTHLY and (file_year, file_month) == (
+            record.period.year,
+            record.period.ordinal,
+        ):
+            return
 
         print(
-            f"[BILGI] [{self.fon_kodu}] Dönem, ek dosya adından düzeltildi: "
-            f"KAP metadata {record.donem:02d}/{record.year} "
-            f"(donem={record.raw_donem!r}, period={record.period_code!r}) -> "
-            f"'{remote_filename}' {file_month:02d}/{file_year}."
+            f"[BILGI] [{self.fon_kodu}] Ek dosya adi '{remote_filename}' "
+            f"{file_month:02d}/{file_year} dönemini ima ediyor, KAP metadata ise "
+            f"{record.period.label}. Dosya adi BAGLAYICI DEGIL; raporun gercek tarihi "
+            f"icerikten belirlenecek (report_dating)."
         )
-        return file_year, file_month
 
     def download_latest_report(self, days_back: int = 365, clean_old_files: bool = True) -> Optional[dict]:
-        """Downloads ONLY the single most recently published monthly
-        "Portfoy Dagilim Raporu" for this fund (see `find_latest_report`),
-        instead of every report found in the window.
+        """Downloads ONLY the single most recently published "Portfoy
+        Dagilim Raporu" for this fund (see `find_latest_report`), instead
+        of every report found in the window.
 
         This fixes the "Date Lag" bug (2026-07-31): `kap_delta_engine.
         collect_global_baseline` used to infer a fund's baseline period
@@ -718,19 +767,23 @@ class KAPPdfDownloader:
         can never accidentally pick up a stale month alongside (or
         instead of) the fresh one.
 
-        The period used for the local filename is KAP's normalized
-        `(year, donem)` (see `normalize_report_period`), then confirmed
-        against the attachment's OWN display filename (e.g.
-        "TLY_2026.08.pdf") -- the authoritative label KAP puts on the
-        document itself, which is what disambiguates a mis-tagged
-        disclosure. The attachment is therefore resolved BEFORE any old
-        local report is cleaned up, so a period correction can never
-        delete the file it was about to keep.
+        The local filename is `{fon_kodu}_{period.slug}.pdf` (e.g.
+        "TLY_2026_HB35.pdf"), i.e. KAP's own period identity rather than a
+        month derived from it. This is what stops two consecutive WEEKLY
+        reports -- both of which KAP labels August and names
+        "TLY_2026.08.pdf" -- from overwriting each other on disk.
 
-        Returns a result dict `{"year", "donem", "status", "file"}` for
-        the single downloaded report, or None if no report could be found
-        at all (logged, never raised -- one fund's missing report must
-        never abort a caller looping over several funds).
+        Note what this method deliberately does NOT do: it does not report
+        the period as a date. A slug identifies a disclosure; the report's
+        real as-of date comes from `report_dating.resolve_as_of_date`,
+        which reads it out of the document's own figures. Callers needing
+        the baseline's validity date must go through that.
+
+        Returns a result dict `{"period_slug", "period_label", "year",
+        "donem", "period_code", "cadence", "publish_date", "status",
+        "file"}`, or None if no report could be found at all (logged,
+        never raised -- one fund's missing report must never abort a
+        caller looping over several funds).
         """
         print(f"[SISTEM] [{self.fon_kodu}] KAP'taki EN GUNCEL '{self.REPORT_TITLE}' araniyor...")
 
@@ -740,40 +793,53 @@ class KAPPdfDownloader:
             return None
 
         print(
-            f"\n[{self.fon_kodu}] {latest.year}/{latest.donem:02d} donemi (EN GUNCEL) isleniyor "
-            f"(disclosureIndex={latest.disclosure_index})..."
+            f"\n[{self.fon_kodu}] {latest.period.label} donemi (EN GUNCEL, yayin "
+            f"{latest.publish_date}) isleniyor (disclosureIndex={latest.disclosure_index})..."
         )
+
+        def describe(status: str, **extra) -> dict:
+            """Every return path reports the same period fields, so a
+            caller never has to reconstruct them from a filename."""
+            return {
+                "period_slug": latest.period.slug,
+                "period_label": latest.period.label,
+                "period_code": latest.period.code,
+                "cadence": latest.period.cadence,
+                "year": latest.period.year,
+                "donem": latest.period.ordinal,
+                "publish_date": latest.publish_date,
+                "disclosure_index": latest.disclosure_index,
+                "status": status,
+                **extra,
+            }
 
         try:
             resolved = self._resolve_attachment(latest.disclosure_index)
             if not resolved:
                 print(f"[HATA] [{self.fon_kodu}] En guncel rapor icin PDF eki bulunamadi.")
-                return {
-                    "year": latest.year,
-                    "donem": latest.donem,
-                    "status": "error",
-                    "message": "PDF eki bulunamadi.",
-                }
+                return describe("error", file=None, message="PDF eki bulunamadi.")
 
             attachment_id, remote_filename = resolved
-            year, donem = self._confirm_period_from_attachment(latest, remote_filename)
+            self._note_attachment_period(latest, remote_filename)
 
             if clean_old_files:
-                self._clean_old_reports(keep_period=(year, donem))
+                self._clean_old_reports(keep_slug=latest.period.slug)
 
-            local_filename = f"{self.fon_kodu}_{year}_{donem:02d}.pdf"
+            local_filename = f"{self.fon_kodu}_{latest.period.slug}.pdf"
             success = self._download_pdf(attachment_id, local_filename)
         except Exception as exc:  # noqa: BLE001 - never let one fund's failure crash a caller's loop
             print(f"[KRITIK HATA] [{self.fon_kodu}] En guncel rapor indirilirken beklenmeyen hata: {exc}")
-            return {"year": latest.year, "donem": latest.donem, "status": "error", "message": str(exc)}
-
-        latest.year, latest.donem = year, donem
+            return describe("error", file=None, message=str(exc))
 
         if not success:
-            return {"year": latest.year, "donem": latest.donem, "status": "error", "file": None}
+            return describe("error", file=None)
 
-        print(f"[SISTEM] [{self.fon_kodu}] En guncel baseline raporu bulundu: {latest.donem:02d}/{latest.year}")
-        return {"year": latest.year, "donem": latest.donem, "status": "success", "file": local_filename}
+        print(
+            f"[SISTEM] [{self.fon_kodu}] En guncel baseline raporu bulundu: "
+            f"{latest.period.label} -> {local_filename} "
+            f"(gercek veri tarihi PDF iceriginden belirlenecek)"
+        )
+        return describe("success", file=local_filename)
 
     # --- Stage 2: resolve the real attachment ID, then download --------------
 
@@ -857,23 +923,29 @@ class KAPPdfDownloader:
     def download_reports(
         self,
         days_back: int = 365,
-        start_period: Optional[Tuple[int, int]] = None,
-        end_period: Optional[Tuple[int, int]] = None,
+        published_since: Optional[date] = None,
+        published_until: Optional[date] = None,
     ) -> List[dict]:
-        """Downloads every available monthly "Portfoy Dagilim Raporu" PDF
-        for this fund published in the last `days_back` days, saving each
-        as "{FON_KODU}_{YIL}_{AY:02d}.pdf" inside `self.output_dir`.
+        """Downloads every available "Portfoy Dagilim Raporu" PDF for this
+        fund published in the last `days_back` days, saving each as
+        "{FON_KODU}_{PERIOD_SLUG}.pdf" (e.g. "TLY_2026_HB35.pdf") inside
+        `self.output_dir`.
 
-        `start_period` / `end_period` are optional inclusive `(year,
-        donem)` bounds -- e.g. `start_period=(2025, 1), end_period=(2025,
-        12)` -- for narrowing the result down to a specific date range
-        without changing how far back KAP itself is queried. Note that
-        `days_back` must still be large enough to cover the requested
-        range, since it controls what KAP's API returns in the first
-        place.
+        `published_since` / `published_until` are optional inclusive
+        PUBLICATION-DATE bounds for narrowing the result down without
+        changing how far back KAP itself is queried (`days_back` must
+        still cover the requested range, since it controls what KAP's API
+        returns in the first place).
+
+        These used to be `(year, donem)` period bounds. That comparison
+        stopped meaning anything once funds began filing weekly: a weekly
+        `donem` is a week number, so `(2026, 34) <= (2026, 8)` compares a
+        week against a month and silently excludes the wrong records.
+        Publication date is well-defined across both cadences.
 
         Returns a list of per-report result dicts, e.g.:
-            [{"year": 2026, "donem": 6, "status": "success", "file": "TLY_2026_06.pdf"}, ...]
+            [{"period_slug": "2026_HB35", "status": "success",
+              "file": "TLY_2026_HB35.pdf", ...}, ...]
 
         Never raises: every per-report failure is caught, logged to the
         console, and recorded in the returned results so one bad report
@@ -882,10 +954,14 @@ class KAPPdfDownloader:
         print(f"[SISTEM] [{self.fon_kodu}] KAP {self.REPORT_TITLE} indirme islemi basliyor...")
 
         records = self._fetch_disclosure_list(days_back)
-        if start_period is not None:
-            records = [r for r in records if (r.year, r.donem) >= start_period]
-        if end_period is not None:
-            records = [r for r in records if (r.year, r.donem) <= end_period]
+        if published_since is not None:
+            records = [
+                r for r in records if r.published_at and r.published_at.date() >= published_since
+            ]
+        if published_until is not None:
+            records = [
+                r for r in records if r.published_at and r.published_at.date() <= published_until
+            ]
 
         if not records:
             print(f"[SISTEM] [{self.fon_kodu}] Indirilecek rapor bulunamadi.")
@@ -893,36 +969,43 @@ class KAPPdfDownloader:
 
         results: List[dict] = []
         for index, record in enumerate(records):
-            local_filename = f"{self.fon_kodu}_{record.year}_{record.donem:02d}.pdf"
+            local_filename = f"{self.fon_kodu}_{record.period.slug}.pdf"
+            base = {
+                "period_slug": record.period.slug,
+                "period_label": record.period.label,
+                "period_code": record.period.code,
+                "cadence": record.period.cadence,
+                "year": record.period.year,
+                "donem": record.period.ordinal,
+                "publish_date": record.publish_date,
+                "disclosure_index": record.disclosure_index,
+            }
             print(
-                f"\n[{self.fon_kodu}] {record.year}/{record.donem:02d} donemi isleniyor "
+                f"\n[{self.fon_kodu}] {record.period.label} donemi isleniyor "
                 f"(disclosureIndex={record.disclosure_index})..."
             )
 
             try:
                 resolved = self._resolve_attachment(record.disclosure_index)
                 if not resolved:
-                    results.append(
-                        {"year": record.year, "donem": record.donem, "status": "error", "message": "PDF eki bulunamadi."}
-                    )
+                    results.append({**base, "status": "error", "file": None, "message": "PDF eki bulunamadi."})
                     continue
 
                 attachment_id, _remote_filename = resolved
                 success = self._download_pdf(attachment_id, local_filename)
                 results.append(
                     {
-                        "year": record.year,
-                        "donem": record.donem,
+                        **base,
                         "status": "success" if success else "error",
                         "file": local_filename if success else None,
                     }
                 )
             except Exception as exc:  # noqa: BLE001 - a single bad report must never abort the run
                 print(
-                    f"[KRITIK HATA] [{self.fon_kodu}] {record.year}/{record.donem:02d} islenirken "
+                    f"[KRITIK HATA] [{self.fon_kodu}] {record.period.label} islenirken "
                     f"beklenmeyen hata: {exc}"
                 )
-                results.append({"year": record.year, "donem": record.donem, "status": "error", "message": str(exc)})
+                results.append({**base, "status": "error", "file": None, "message": str(exc)})
 
             if index != len(records) - 1:
                 time.sleep(self.request_delay)

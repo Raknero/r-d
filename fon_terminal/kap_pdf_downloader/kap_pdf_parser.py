@@ -1,10 +1,13 @@
 """
 kap_pdf_parser.py
 
-Standalone, self-contained module for parsing a fund's monthly
-"Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF -- as downloaded
-by `kap_downloader.py` -- into a clean {hisse_kodu: lot_miktari} dictionary
-for the "HISSE SENETLERI" (equities) section only.
+Standalone, self-contained module for parsing a fund's
+"Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF -- weekly or
+monthly, as downloaded by `kap_downloader.py` -- into a clean
+{hisse_kodu: lot_miktari} dictionary for the "HISSE SENETLERI"
+(equities) section only. The filename slug identifies WHICH filing the
+PDF is; WHEN its holdings were valued is established separately from
+the document's own figures (`extract_fingerprint` + `report_dating`).
 
 This module lives in the same isolated sandbox as `kap_downloader.py` and
 has no dependency on any other part of the host project; it only needs the
@@ -18,7 +21,12 @@ Usage:
     # {"ALKLC": 731256.0, "CWENE": 3000000.0, ...}
 
     history = parser.parse_directory("tly_pdfs")
-    # {"2026_01": {...}, "2026_02": {...}, "2026_03": {...}}
+    # {"2026_AB06": {...}, "2026_AB07": {...}, "2026_HB35": {...}}
+
+    fingerprint = parser.extract_fingerprint("tly_pdfs/TLY_2026_HB35.pdf")
+    # ReportFingerprint(cadence="HAFTALIK", total_value=247632508542.43, ...)
+    # -- the evidence `report_dating` uses to date the report, since the
+    # document's own period label is not reliable (see ReportFingerprint).
 """
 
 from __future__ import annotations
@@ -27,15 +35,75 @@ import html
 import json
 import os
 import re
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
 
 
+# Cadence labels used by `ReportFingerprint.cadence` -- derived from the
+# report's OWN wording ("Haftalık Pay Fiyatı" vs "Aylık Pay Fiyatı"),
+# independently of whatever cadence KAP's `period` metadata claims.
+CADENCE_WEEKLY = "HAFTALIK"
+CADENCE_MONTHLY = "AYLIK"
+
+
+@dataclass
+class ReportFingerprint:
+    """Everything a Portfoy Dagilim Raporu PDF says about WHEN it is from
+    -- collected in one pass so the report's true as-of date can be
+    established without trusting its (demonstrably wrong) period label.
+
+    Why this exists (2026-09-14): funds moved to WEEKLY portfolio
+    disclosure, but the documents kept their monthly-era labelling. TLY's
+    report published 09.09.2026 is headed "Ağustos-2026", its KAP
+    attachment is named "TLY_2026.08.pdf", and its `donem` metadata is a
+    week number (35) -- yet its holdings are valued at the 04.09.2026
+    BIST close and include positions bought on 01-04 September. Every
+    label on the document points at August; every piece of DATA in it
+    points at September. So dating a report now means reading its data,
+    not its label (see `report_dating.resolve_as_of_date`).
+
+    The three header figures are the load-bearing ones: `total_value`,
+    `share_count` and `unit_price` appear verbatim in TEFAS's own daily
+    series for the same fund, so matching all three pins the report to a
+    single TEFAS day exactly. `newest_purchase_date` is an independent
+    cross-check -- a position bought on date D proves the snapshot is
+    from D or later -- and `valuation_prices` are the per-stock prices
+    the report itself used, which match that day's real BIST closes.
+
+    Every field is Optional: a PDF that omits (or renders unparseably)
+    any of them yields None for that field rather than raising, and the
+    caller decides whether what's left is enough to date the report.
+    """
+
+    source_path: str
+    cadence: Optional[str] = None            # CADENCE_WEEKLY / CADENCE_MONTHLY
+    declared_period_label: Optional[str] = None   # e.g. "Ağustos-2026" (unreliable)
+    total_value: Optional[float] = None     # "Toplam Değer/Net Varlık Değeri"
+    share_count: Optional[float] = None     # "Katılma Payı Sayısı"
+    unit_price: Optional[float] = None      # "Haftalık/Aylık Pay Fiyatı (TL)"
+    previous_unit_price: Optional[float] = None   # "Önceki Hafta/Ay Pay Fiyatı (TL)"
+    newest_purchase_date: Optional[date] = None
+    valuation_prices: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def header_figures(self) -> Dict[str, float]:
+        """The header figures that are actually present, keyed by the
+        TEFAS field each one corresponds to -- this mapping is what
+        `report_dating` matches against TEFAS's daily records."""
+        pairs = {
+            "ToplamDeger": self.total_value,
+            "Pay": self.share_count,
+            "Fiyat": self.unit_price,
+        }
+        return {key: value for key, value in pairs.items() if value is not None}
+
+
 class KAPPdfParser:
     """Extracts the "HISSE SENETLERI" (equities) holdings table out of a
-    KAP monthly Portfoy Dagilim Raporu PDF.
+    KAP Portfoy Dagilim Raporu PDF (weekly or monthly).
 
     Why this needs more than a naive `page.extract_tables()` call:
 
@@ -90,10 +158,69 @@ class KAPPdfParser:
     # with proper TR grouping.
     NUMBER_PATTERN = re.compile(r"^-?\d{1,3}(\.\d{3})*(,\d+)?$")
 
-    # Matches "TLY_2026_03.pdf" (or any "..._{YYYY}_{MM}..." filename) so
-    # `parse_directory` can key its results by period without depending on
-    # any particular fund code prefix.
-    PERIOD_FILENAME_PATTERN = re.compile(r"(\d{4})_(\d{2})")
+    # Matches the period slug in a filename produced by
+    # `KAPPdfDownloader`, so `parse_directory` can key its results without
+    # depending on any particular fund code prefix:
+    #
+    #   "TLY_2026_HB35.pdf" -> "2026_HB35"   (weekly, KAP period="HB")
+    #   "THF_2026_AB08.pdf" -> "2026_AB08"   (monthly, KAP period="AB")
+    #   "TLY_2026_08.pdf"   -> "2026_08"     (legacy, pre-2026-09-14 files)
+    #
+    # The optional letter prefix is what keeps two WEEKLY reports from the
+    # same calendar month distinguishable -- under the old bare-"YYYY_MM"
+    # scheme they collided on one key and one filename (see
+    # `ReportFingerprint`).
+    PERIOD_FILENAME_PATTERN = re.compile(r"(\d{4})_([A-Z]{0,2}\d{2})")
+
+    # --- Report dating (see `ReportFingerprint`) -----------------------------
+
+    # Unambiguous page-1 header figures, e.g.
+    # "D-)Toplam Değer/Net Varlık Değeri : 247.632.508.542,43".
+    _HEADER_FIGURE_PATTERNS = {
+        "total_value": re.compile(r"Toplam\s+De[ğg]er\s*/\s*Net\s+Varl[ıi]k\s+De[ğg]eri\s*:\s*([\d.,]+)"),
+        "share_count": re.compile(r"Kat[ıi]lma\s+Pay[ıi]\s+Say[ıi]s[ıi]\s*:\s*([\d.,]+)"),
+    }
+
+    # The fund's unit price, whose LABEL also states the report's cadence:
+    #
+    #   weekly : "A-)Haftalık Pay Fiyatı (TL) : 9.495,638007"
+    #   monthly: "A-)Ay Sonu Pay Fiyatı (TL) : 2,724426"
+    #
+    # Note the monthly wording -- "Ay Sonu" (month END) -- which is the
+    # document itself confirming that a monthly report is a month-end
+    # snapshot, whereas a weekly one is simply "Haftalık" with no such
+    # anchor. `(TL)` is required because USD-quoted funds (e.g. TMM) print
+    # a second, dot-decimal "(USD)" line right underneath.
+    _UNIT_PRICE_PATTERN = re.compile(
+        r"(Haftal[ıi]k|Ay\s+Sonu|Ayl[ıi]k)\s+Pay\s+Fiyat[ıi]\s*\(TL\)\s*:\s*([\d.,]+)"
+    )
+    _PREVIOUS_PRICE_PATTERN = re.compile(
+        r"[ÖO]nceki\s+(?:Hafta|Ay)\s+Pay\s+Fiyat[ıi]?\s*\(TL\)\s*:\s*([\d.,]+)"
+    )
+
+    # Cadence fallback for a report whose price line can't be read at all:
+    # the "... Ortalama Portföydeki Menkul Kıymetler Yüzdesi" heading is
+    # worded per cadence too.
+    _CADENCE_FALLBACK_PATTERN = re.compile(r"(Haftal[ıi]k|Ayl[ıi]k)\s+Ortalama\s+Portf[öo]y")
+
+    # One equity holding row, e.g.
+    #   "AKBNK TL AKBANK TRAAKBNK91N6 3.639.400,00 66,953631 14/08/26 80100511 71,850000 261.490.890,00 ..."
+    #    ticker      issuer   ISIN     nominal      birim alış  SATIN ALIŞ  hesap   BORSA FİYATI  toplam değer
+    #
+    # Only rows whose `nominal x borsa fiyatı == toplam değer` are accepted
+    # (see `_scan_equity_rows`), which is what makes this text-position
+    # regex safe on a borderless PDF: an accidental column mis-read fails
+    # the arithmetic and is discarded rather than silently producing a
+    # wrong date or price.
+    _EQUITY_ROW_PATTERN = re.compile(
+        r"^([A-Z]{4,6})\s+TL\s+.*?"
+        r"([\d.]+,\d+)\s+"              # nominal değer (lot)
+        r"[\d.]+,\d+\s+"                # birim alış fiyatı
+        r"(\d{2})/(\d{2})/(\d{2})\s+"   # satın alış tarihi
+        r"\d+\s+"                       # hesap / portföy kodu
+        r"([\d.]+,\d+)\s+"              # BORSA FİYATI (değerleme fiyatı)
+        r"(-?[\d.]+,\d+)"               # toplam değer
+    )
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
@@ -156,14 +283,19 @@ class KAPPdfParser:
 
     def parse_directory(self, dirpath: str) -> Dict[str, Dict[str, float]]:
         """Parses every "*.pdf" file in `dirpath` and returns a nested
-        dictionary keyed by the "{YIL}_{AY}" period parsed out of each
-        filename, e.g.:
+        dictionary keyed by the period slug parsed out of each filename
+        (see `PERIOD_FILENAME_PATTERN`), e.g.:
 
-            {"2026_01": {"ALKLC": 731256.0, ...}, "2026_02": {...}}
+            {"2026_AB07": {"ALKLC": 731256.0, ...}, "2026_HB35": {...}}
 
-        Files whose name doesn't contain a recognizable "YYYY_MM" period
-        (as produced by `KAPPdfDownloader`, e.g. "TLY_2026_01.pdf") are
-        skipped with a console warning rather than raising.
+        A period slug identifies WHICH DISCLOSURE a file came from; it is
+        not a date and must never be treated as one. The report's actual
+        as-of date is established from its contents instead, by
+        `report_dating.resolve_as_of_date`.
+
+        Files whose name carries no recognizable slug (as produced by
+        `KAPPdfDownloader`) are skipped with a console warning rather than
+        raising.
         """
         if not os.path.isdir(dirpath):
             self._log(f"[HATA] Klasör bulunamadı: {dirpath}")
@@ -179,13 +311,150 @@ class KAPPdfParser:
         for filename in pdf_filenames:
             period_key = self._extract_period_key(filename)
             if period_key is None:
-                self._log(f"[UYARI] '{filename}' dosya adından tarih (YYYY_AA) çıkarılamadı, atlanıyor.")
+                self._log(f"[UYARI] '{filename}' dosya adından dönem kimliği (YYYY_HB35 / YYYY_AB08) çıkarılamadı, atlanıyor.")
                 continue
 
             filepath = os.path.join(dirpath, filename)
             results[period_key] = self.parse_file(filepath)
 
         return results
+
+    # --- Report dating ---------------------------------------------------------
+
+    def extract_fingerprint(self, filepath: str) -> ReportFingerprint:
+        """Reads everything the PDF says about its own date into a
+        `ReportFingerprint` (see that dataclass for why label-based dating
+        no longer works at all).
+
+        Deliberately uses raw `page.extract_text()` lines rather than the
+        table-extraction machinery `parse_file` needs: the header figures
+        live in the prose block ABOVE the holdings table (which
+        `_extract_rows` crops away on purpose), and the equity rows are
+        matched by a self-validating regex instead of by column position
+        (see `_EQUITY_ROW_PATTERN`).
+
+        Never raises: an unreadable file, a missing header line, or a
+        holdings table whose columns don't parse all leave the
+        corresponding field as None, and the caller decides whether the
+        remainder is enough to date the report.
+        """
+        fingerprint = ReportFingerprint(source_path=filepath)
+
+        try:
+            with pdfplumber.open(filepath) as pdf:
+                pages_text = [page.extract_text() or "" for page in pdf.pages]
+        except FileNotFoundError:
+            self._log(f"[HATA] Dosya bulunamadı: {filepath}")
+            return fingerprint
+        except Exception as exc:  # noqa: BLE001 - a single bad PDF must never crash a batch run
+            self._log(f"[HATA] '{filepath}' parmak izi okunurken beklenmeyen hata: {exc}")
+            return fingerprint
+
+        if not pages_text:
+            return fingerprint
+
+        first_page = pages_text[0]
+        self._read_header_figures(first_page, fingerprint)
+        self._scan_equity_rows(pages_text, fingerprint)
+        return fingerprint
+
+    def _read_header_figures(self, first_page: str, fingerprint: ReportFingerprint) -> None:
+        """Fills in the page-1 header fields (cadence, declared period
+        label and the three TEFAS-matchable figures) on `fingerprint`."""
+        lines = [line.strip() for line in first_page.split("\n") if line.strip()]
+
+        # The declared period is always the 2nd line ("Ağustos-2026").
+        # Recorded for the audit trail ONLY -- it is the very label that
+        # proved untrustworthy, never an input to any date calculation.
+        if len(lines) > 1:
+            fingerprint.declared_period_label = lines[1]
+
+        for field_name, pattern in self._HEADER_FIGURE_PATTERNS.items():
+            match = pattern.search(first_page)
+            if not match:
+                continue
+            try:
+                setattr(fingerprint, field_name, self._turkish_str_to_float(match.group(1)))
+            except ValueError:
+                continue
+
+        # The price lines are matched per LINE rather than across the whole
+        # page, so that "Önceki Ay Pay Fiyatı" (the PREVIOUS period's
+        # price) and "Aylık Pay Fiyatı Artış Oranı" (a percentage, not a
+        # price) can never be mistaken for the current unit price.
+        for line in lines:
+            if "Fiyat" not in line:
+                continue
+
+            if fingerprint.previous_unit_price is None:
+                previous = self._PREVIOUS_PRICE_PATTERN.search(line)
+                if previous:
+                    try:
+                        fingerprint.previous_unit_price = self._turkish_str_to_float(previous.group(1))
+                    except ValueError:
+                        pass
+                    continue
+
+            if fingerprint.unit_price is not None:
+                continue
+            if "Önceki" in line or "Artış" in line or "Artis" in line:
+                continue
+            current = self._UNIT_PRICE_PATTERN.search(line)
+            if not current:
+                continue
+            try:
+                fingerprint.unit_price = self._turkish_str_to_float(current.group(2))
+            except ValueError:
+                continue
+            fingerprint.cadence = (
+                CADENCE_WEEKLY if current.group(1).lower().startswith("haftal") else CADENCE_MONTHLY
+            )
+
+        if fingerprint.cadence is None:
+            fallback = self._CADENCE_FALLBACK_PATTERN.search(first_page)
+            if fallback:
+                fingerprint.cadence = (
+                    CADENCE_WEEKLY if fallback.group(1).lower().startswith("haftal") else CADENCE_MONTHLY
+                )
+
+    def _scan_equity_rows(self, pages_text: List[str], fingerprint: ReportFingerprint) -> None:
+        """Collects the newest "Satın Alış Tarihi" and the per-stock
+        valuation prices ("Borsa Fiyatı") across every equity row.
+
+        A row only counts if `nominal x borsa fiyatı == toplam değer`
+        holds -- on a borderless PDF the column split can drift, and this
+        arithmetic check is what distinguishes a correctly-read row from a
+        mis-read one. Silently dropping the mis-reads is safe here because
+        both outputs are corroborating evidence: the newest purchase date
+        is a LOWER bound on the snapshot date, so missing a row can only
+        ever make the bound weaker, never wrong.
+        """
+        for page_text in pages_text:
+            for line in page_text.split("\n"):
+                match = self._EQUITY_ROW_PATTERN.match(line.strip())
+                if not match:
+                    continue
+
+                ticker, raw_nominal, day, month, year, raw_price, raw_total = match.groups()
+                try:
+                    nominal = self._turkish_str_to_float(raw_nominal)
+                    price = self._turkish_str_to_float(raw_price)
+                    total = self._turkish_str_to_float(raw_total)
+                except ValueError:
+                    continue
+
+                # Columns read correctly only if the row's own arithmetic holds.
+                if abs(nominal * price - total) > max(abs(total) * 1e-6, 1.0):
+                    continue
+
+                fingerprint.valuation_prices.setdefault(ticker, price)
+
+                try:
+                    purchased = date(2000 + int(year), int(month), int(day))
+                except ValueError:
+                    continue
+                if fingerprint.newest_purchase_date is None or purchased > fingerprint.newest_purchase_date:
+                    fingerprint.newest_purchase_date = purchased
 
     # --- Row extraction --------------------------------------------------------
 
@@ -268,9 +537,10 @@ class KAPPdfParser:
         return float(cleaned)
 
     def _extract_period_key(self, filename: str) -> Optional[str]:
-        """Pulls a "{YYYY}_{MM}" period key out of a filename like
-        "TLY_2026_03.pdf" -> "2026_03". Returns None if no such pattern is
-        present.
+        """Pulls the period slug out of a filename, e.g.
+        "TLY_2026_HB35.pdf" -> "2026_HB35" (and the legacy
+        "TLY_2026_03.pdf" -> "2026_03"). Returns None if no such pattern
+        is present. See `PERIOD_FILENAME_PATTERN`.
         """
         match = self.PERIOD_FILENAME_PATTERN.search(filename)
         if not match:
@@ -372,6 +642,29 @@ def _format_display_date(date_str: Optional[str]) -> str:
     other Turkish-formatted values. Passed through as-is (never raises)
     if it doesn't look like a plain slash-separated date."""
     return str(date_str or "").replace("/", ".")
+
+
+def _format_baseline_as_of(value) -> Optional[str]:
+    """Formats the baseline report's MEASURED valuation date (see
+    `kap_delta_engine.date_baseline_report`) as "DD.MM.YYYY" for the
+    report's descriptive text, accepting either a `date`/`datetime` or an
+    ISO "YYYY-MM-DD" string so the caller can pass whatever it has.
+
+    Returns `None` -- not a fabricated date -- when the value is missing
+    or unparseable, so the surrounding copy can fall back to naming the
+    baseline PDF instead of stating a date the pipeline never established.
+    """
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return None
 
 
 def _aggregate_signed_lot_deltas(
@@ -484,7 +777,7 @@ def _build_evolution_chart_payload(rows: List[tuple]) -> dict:
 
     - `weights`: top-10 tickers by Güncel Ağırlık (%), remainder collapsed
       into a single "Diğerleri" slice (only rows with a known weight).
-    - `deltas`: finite, non-zero "Ay Başından Beri Lot Değişimi (%)"
+    - `deltas`: finite, non-zero "Taban Tarihinden Beri Lot Değişimi (%)"
       values only (baseline_lot > 0 and pct != 0). Empty list means the
       bar chart should show the no-delta placeholder instead.
     """
@@ -530,7 +823,7 @@ def _build_evolution_chart_payload(rows: List[tuple]) -> dict:
 
 
 def _render_evolution_charts(chart_payload: dict) -> str:
-    """Renders the two Chart.js canvases (weight donut + month-to-date
+    """Renders the two Chart.js canvases (weight donut + since-baseline
     lot-change bars) above the portfolio evolution table. Injects
     `chartData` via `json.dumps` so the browser-side script needs no
     further Python. If every lot-change % is zero, the bar chart is
@@ -546,9 +839,9 @@ def _render_evolution_charts(chart_payload: dict) -> str:
         else '<p class="chart-placeholder">Güncel ağırlık verisi bulunamadı (fiyat veya AUM eksik).</p>'
     )
     delta_body = (
-        '<canvas id="deltaChart" aria-label="Ay Başından Beri Lot Değişimi"></canvas>'
+        '<canvas id="deltaChart" aria-label="Taban Tarihinden Beri Lot Değişimi"></canvas>'
         if has_deltas
-        else '<p class="chart-placeholder">Ay başından beri yeni işlem (delta) bulunmamaktadır.</p>'
+        else '<p class="chart-placeholder">Taban raporunun veri tarihinden beri yeni işlem (delta) bulunmamaktadır.</p>'
     )
 
     return f"""
@@ -558,7 +851,7 @@ def _render_evolution_charts(chart_payload: dict) -> str:
           <div class="chart-canvas-wrap">{weight_body}</div>
         </div>
         <div class="chart-card">
-          <h3>Ay Başından Beri Lot Değişimi (%)</h3>
+          <h3>Taban Tarihinden Beri Lot Değişimi (%)</h3>
           <div class="chart-canvas-wrap">{delta_body}</div>
         </div>
       </div>
@@ -631,7 +924,7 @@ def _render_evolution_charts(chart_payload: dict) -> str:
               data: {{
                 labels: deltas.labels,
                 datasets: [{{
-                  label: "Ay Başından Beri Lot Değişimi (%)",
+                  label: "Taban Tarihinden Beri Lot Değişimi (%)",
                   data: deltas.values,
                   backgroundColor: colors,
                   borderColor: borders,
@@ -698,11 +991,14 @@ def _render_portfolio_evolution_table(
     one row per ticker showing its FULL journey from the KAP PDF baseline
     to the current estimated holding -- Başlangıç Lot, Kesinleşen Delta
     Lot (net, signed), Oransal Tahmini Delta Lot (net, signed), Güncel
-    Tahmini Lot, and an "Ay Başından Beri Lot Değişimi (%)" that puts every
-    other column into context (a "-69 milyon lot" delta means nothing on
-    its own; "-69 milyon lot, başlangıcın %35'i" does). This percentage is
-    intentionally month-to-date vs the last PDF baseline -- NOT a long-term
-    trend (see the bold warning rendered above the table).
+    Tahmini Lot, and a "Taban Tarihinden Beri Lot Değişimi (%)" that puts
+    every other column into context (a "-69 milyon lot" delta means
+    nothing on its own; "-69 milyon lot, başlangıcın %35'i" does). This
+    percentage is intentionally measured only from the baseline PDF's own
+    valuation date onward -- NOT a long-term trend (see the bold warning
+    rendered above the table). Since KAP moved these reports to a WEEKLY
+    cadence (2026-09) that window can be as short as a few days, which is
+    why neither the column nor the warning says "ay" anymore.
 
     `Güncel Tahmini Lot` is computed directly as `Başlangıç + Kesinleşen +
     Oransal` (not read from `updated_data`) so the table is internally
@@ -732,7 +1028,7 @@ def _render_portfolio_evolution_table(
     cumulative Başlangıç/Kesinleşen/Oransal/Güncel/% figures, which are
     computed exactly as before.
 
-    Two more columns follow "Ay Başından Beri Lot Değişimi (%)": "Güncel
+    Two more columns follow "Taban Tarihinden Beri Lot Değişimi (%)": "Güncel
     Fiyat (TL)"
     (from `current_prices`, see `kap_delta_engine.fetch_bist_prices`) and
     "Güncel Ağırlık (%)" -- `(Güncel Tahmini Lot * Güncel Fiyat /
@@ -746,7 +1042,7 @@ def _render_portfolio_evolution_table(
 
     Above the table, two Chart.js visuals are rendered from the SAME row
     math (no engine changes): a donut of Güncel Ağırlık (top 10 +
-    "Diğerleri") and a bar chart of non-zero month-to-date lot-change %
+    "Diğerleri") and a bar chart of non-zero since-baseline lot-change %
     (green buys / red sells), or an explicit placeholder when every
     change is still 0%.
 
@@ -864,7 +1160,7 @@ def _render_portfolio_evolution_table(
                 <th class="num">Oransal Tahmini Delta Lot</th>
                 <th>İşlem Tarihçesi</th>
                 <th class="num">Güncel Tahmini Lot</th>
-                <th class="num">Ay Başından Beri Lot Değişimi (%)</th>
+                <th class="num">Taban Tarihinden Beri Lot Değişimi (%)</th>
                 <th class="num">Güncel Fiyat (TL)</th>
                 <th class="num">Güncel Ağırlık (%)</th>
               </tr>
@@ -1002,6 +1298,11 @@ def _render_delta_sections(delta_report: dict) -> str:
     """
     fon_kodu = delta_report.get("fon_kodu") or ""
     baseline_period = delta_report.get("baseline_period") or "?"
+    # The report's OWN valuation date, measured from its contents by
+    # `kap_delta_engine.date_baseline_report`. `baseline_period` is only a
+    # KAP filing label and is NOT a date -- since KAP moved to weekly
+    # filings it routinely says "Ağustos-2026" on September data.
+    baseline_as_of = _format_baseline_as_of(delta_report.get("baseline_as_of"))
     baseline_data = delta_report.get("baseline_data") or {}
     resolved = delta_report.get("resolved") or []
     unresolved = delta_report.get("unresolved") or []
@@ -1093,11 +1394,26 @@ def _render_delta_sections(delta_report: dict) -> str:
     tefas_power_html = _render_tefas_power_table(tefas_power_matrix, fon_kodu)
     tefas_power_days = len({date_str for daily in tefas_power_matrix.values() for date_str in daily})
 
+    # Always name the KAP filing label AND, when it was established, the
+    # measured valuation date -- they are routinely different periods
+    # since KAP went weekly, and only the second one bounds the deltas.
+    baseline_ref = (
+        f"{baseline_period} dönemi (ölçülen veri tarihi {baseline_as_of})"
+        if baseline_as_of
+        else f"{baseline_period} dönemi"
+    )
+    delta_window_note = (
+        f"taban raporun KENDİ verisinden ölçülen değerleme tarihinden ({baseline_as_of}) "
+        "bu yana"
+        if baseline_as_of
+        else "taban raporun değerleme tarihinden bu yana"
+    )
+
     return f"""
   <div class="delta-sections">
     <section class="period-card">
       <h2>Kesinleşen Deltalar <span class="badge ok">{len(resolved)} işlem</span></h2>
-      <p class="section-desc">{html.escape(fon_kodu)} baseline dönemi {html.escape(baseline_period)} sonrası, sadece {html.escape(fon_kodu)}'yı kapsayan ve başarıyla uygulanmış işlemler.</p>
+      <p class="section-desc">{html.escape(fon_kodu)} baseline'ı {html.escape(baseline_ref)} sonrası, sadece {html.escape(fon_kodu)}'yı kapsayan ve başarıyla uygulanmış işlemler. Değerleme tarihi ve öncesindeki bildirimler, taban PDF'in içinde ZATEN yer aldığı için işleme alınmaz (çift sayma koruması).</p>
       {resolved_html}
     </section>
     <section class="period-card">
@@ -1112,8 +1428,8 @@ def _render_delta_sections(delta_report: dict) -> str:
     </section>
     <section class="period-card">
       <h2>Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti) <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_period)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Ay Başından Beri Lot Değişimi (%)", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo "portföyün en büyük pozisyonu ne?" sorusuna göre Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
-      <p class="section-alert"><strong>DİKKAT: Lot değişim oranları uzun vadeli yatırım trendini yansıtmaz. Bu oranlar sadece son PDF taban tarihinden (ay sonu) bu yana gerçekleşen işlemleri gösterir ve her ay başında PDF'in güncellenmesiyle sıfırlanır.</strong></p>
+      <p class="section-desc">{html.escape(baseline_ref)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Taban Tarihinden Beri Lot Değişimi (%)", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo "portföyün en büyük pozisyonu ne?" sorusuna göre Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
+      <p class="section-alert"><strong>DİKKAT: Lot değişim oranları uzun vadeli yatırım trendini yansıtmaz. Bu oranlar sadece {html.escape(delta_window_note)} gerçekleşen işlemleri gösterir ve KAP her yeni portföy dağılım raporunu yayınladığında sıfırlanır -- bu raporlar artık HAFTALIK yayınlandığı için pencere birkaç gün kadar kısa olabilir. Raporun dönem etiketi ("Ağustos-2026" gibi) bir tarih DEĞİLDİR ve hesaplamada kullanılmaz; değerleme tarihi PDF'in kendi verisinden ölçülür.</strong></p>
       {evolution_html}
     </section>
     <section class="period-card">
@@ -1152,7 +1468,9 @@ def export_to_html(
 
         {
             "fon_kodu": "TLY",
-            "baseline_period": "2026_03",             # which parsed_data key was used as the delta baseline
+            "baseline_period": "2026_HB35",           # which parsed_data key was used as the delta baseline (a KAP filing label, NOT a date)
+            "baseline_as_of": date(2026, 9, 4),         # optional -- the baseline's MEASURED valuation date
+            "baseline_delta_start": date(2026, 9, 5),   # optional -- first day the deltas may cover
             "baseline_data": {"ALKLC": 731256.0, ...},  # that period's raw holdings -- the "Başlangıç Lot" column
             "resolved": [                               # single-fund, applied deltas
                 {"date": "23/07/2026", "ticker": "BIGEN", "lot": 42469924.0, "direction": "ALIM"},

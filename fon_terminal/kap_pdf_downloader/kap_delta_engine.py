@@ -2,10 +2,13 @@
 kap_delta_engine.py
 
 Standalone, self-contained module that keeps a fund's holdings snapshot
-"fresh" between two monthly "Portfoy Dagilim Raporu" (Portfolio Allocation
-Report) publications, by layering KAP's intra-month "Pay Alim Satim
-Bildirimi" (Shares Transaction Notification) disclosures on top of the
-last known PDF-derived baseline.
+"fresh" between two successive "Portfoy Dagilim Raporu" (Portfolio
+Allocation Report) publications -- weekly or monthly, whichever cadence
+the fund files -- by layering KAP's "Pay Alim Satim Bildirimi" (Shares
+Transaction Notification) disclosures on top of the last known
+PDF-derived baseline. The gap those disclosures fill is bounded by the
+report's MEASURED valuation date, not by its (unreliable) period label;
+see `date_baseline_report` / `report_dating`.
 
 Endpoint history / correction (2026-07-28):
     The first version of this module queried the same `FILTERYFBF`
@@ -42,69 +45,95 @@ IMPORTANT / UNRESOLVED DATA LIMITATION (verified live, not assumed):
     guessing here would silently corrupt financial data.
 
 Usage:
-    from kap_delta_engine import KAPDeltaEngine, baseline_period_to_delta_start
+    from kap_delta_engine import KAPDeltaEngine, date_baseline_report
+    from report_dating import load_tefas_records
     from datetime import date
 
-    baseline = {"SVGYO": 10000.0}  # from KAPPdfParser.parse_file(...) for 2026/06
-    start = baseline_period_to_delta_start(2026, 6)  # -> 2026-07-01 (day AFTER PDF month ends)
+    pdf = "tly_pdfs/TLY_2026_HB35.pdf"          # from KAPPdfDownloader
+    baseline = KAPPdfParser().parse_file(pdf)    # {"SVGYO": 10000.0, ...}
+
+    # WHEN the baseline is valid is read out of the PDF's own figures, never
+    # out of its period label -- see report_dating for why.
+    records = load_tefas_records(["TLY"])
+    dated = date_baseline_report("TLY", pdf, records["TLY"])
+    # dated.as_of       -> 2026-09-04  (holdings valued at this close)
+    # dated.delta_start -> 2026-09-05  (first day safe to layer deltas on)
+
     with KAPDeltaEngine(fon_kodu="TLY") as engine:
         updated, resolved, unresolved = engine.apply_delta(
-            baseline, start_date=start.isoformat(), end_date=date.today().isoformat()
+            baseline,
+            start_date=dated.delta_start.isoformat(),
+            end_date=date.today().isoformat(),
         )
 """
 
 from __future__ import annotations
 
-import calendar
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
 from kap_downloader import KAPPdfDownloader, _request_with_retry
 from kap_pdf_parser import KAPPdfParser
+from report_dating import AsOfResolution, ReportDatingError, load_tefas_records, resolve_as_of_date
 
 
-def baseline_period_end_date(year: int, donem: int) -> date:
-    """Last calendar day of a monthly KAP PDF baseline period
-    (e.g. 2026/07 -> 2026-07-31), via `calendar.monthrange`.
+def date_baseline_report(
+    fon_kodu: str,
+    pdf_path: str,
+    tefas_records: Sequence[dict],
+    parser: Optional[KAPPdfParser] = None,
+    execution_logs: Optional[List[Dict[str, str]]] = None,
+) -> AsOfResolution:
+    """Establishes WHEN a baseline PDF's holdings were valued, which is
+    the last date whose buy/sell disclosures are already inside it -- so
+    the delta window must open the day after (`resolution.delta_start`).
 
-    Raises a self-explanatory `ValueError` when `donem` isn't a month.
-    `calendar.monthrange`'s own "month must be in 1..12" says nothing
-    about WHICH fund/report caused it, and KAP does occasionally file a
-    report with a non-month period tag (a week-of-year, see
-    `kap_downloader.normalize_report_period`, which is where such a tag
-    is supposed to be resolved before ever reaching this function).
+    This replaced `baseline_period_end_date()`/
+    `baseline_period_to_delta_start()`, which derived that date from the
+    report's period label by taking the last day of the month. That was
+    correct for as long as these reports were monthly, and became wrong
+    the moment funds started filing WEEKLY (2026-09): a weekly report is
+    labelled with the month it happens to fall in, so its holdings --
+    valued 04.09.2026 for TLY, TMV and DOH -- were treated as valid
+    through 31.08.2026 only. Every transaction notification from 01-04
+    September was then applied on top of a baseline that already
+    contained it: silent double counting, four days wide, in the
+    direction that overstates the fund's trading.
+
+    The date now comes from `report_dating.resolve_as_of_date`, which
+    reads it out of the document's own figures (see that module). Both
+    cadences resolve through the same rule -- monthly reports still land
+    on their month end -- so this is not a weekly special case, it is the
+    removal of a label-based assumption.
+
+    Raises `ReportDatingError` if the date cannot be established. That is
+    deliberate: the previous behaviour of falling back to a month end is
+    exactly what made this bug invisible for as long as it lasted, since
+    a fabricated date is always plausible and never distinguishable in
+    the logs from a verified one.
     """
-    if not isinstance(donem, int) or not 1 <= donem <= 12:
-        raise ValueError(
-            f"Baseline dönemi bir ay (1-12) olmalı, alınan donem={donem!r} (year={year!r}). "
-            "KAP bu raporu ay yerine farklı bir dönem etiketiyle (örn. hafta) yayınlamış olabilir; "
-            "kap_downloader.normalize_report_period bunu aya çevirmekle yükümlü."
-        )
-    last_day = calendar.monthrange(year, donem)[1]
-    return date(year, donem, last_day)
+    parser = parser or KAPPdfParser(verbose=False)
+    fingerprint = parser.extract_fingerprint(pdf_path)
+    resolution = resolve_as_of_date(fon_kodu, fingerprint, tefas_records)
 
-
-def baseline_period_to_delta_start(year: int, donem: int) -> date:
-    """Returns the first calendar day AFTER a monthly KAP PDF baseline
-    period ends -- the earliest date whose buy/sell disclosures may be
-    layered on top of that PDF without double-counting.
-
-    A "Portföy Dağılım Raporu" for period `(year, donem)` (e.g. 2026/07)
-    already reflects the fund's holdings as of the LAST day of that month
-    (31.07.2026). Applying any intra-month trade whose İşlem Tarihi falls
-    on or before that last day would re-apply lots the PDF already
-    contains. So the delta window must open on day `last_day + 1`
-    (01.08.2026 here), computed via `calendar.monthrange` so Feb/30-day
-    months are handled correctly rather than hard-coding day 31.
-    """
-    return baseline_period_end_date(year, donem) + timedelta(days=1)
+    _log_step(
+        execution_logs,
+        f"Rapor tarihlendi: fon={fon_kodu}, PDF='{os.path.basename(pdf_path)}', "
+        f"ritim={fingerprint.cadence or 'bilinmiyor'}, "
+        f"PDF'in kendi etiketi={fingerprint.declared_period_label!r} (YOK SAYILDI). "
+        f"Değerleme günü (baseline geçerlilik sonu)={_format_tr_date(resolution.as_of)}, "
+        f"delta penceresi bu günün ERTESİNDEN başlar={_format_tr_date(resolution.delta_start)}. "
+        f"Kanıt: {' | '.join(resolution.evidence)}",
+    )
+    return resolution
 
 
 def _format_tr_date(value: date) -> str:
@@ -670,10 +699,11 @@ class KAPDeltaEngine:
         month (already baked into that PDF). Any parsed row whose
         İşlem Tarihi is strictly before `start_date` is therefore
         skipped -- never applied to baseline, never added to
-        `resolved`/`unresolved` -- so the monthly PDF and the daily
+        `resolved`/`unresolved` -- so the baseline PDF and the daily
         deltas never overlap. Callers should set `start_date` via
-        `baseline_period_to_delta_start(year, donem)` (the day AFTER the
-        PDF month's last calendar day).
+        `date_baseline_report(...).delta_start` (the day AFTER the date
+        the PDF's holdings were actually valued, measured from the
+        document's own figures rather than from its period label).
         """
         print(f"[SISTEM] [{self.fon_kodu}] Delta motoru calisiyor: {start_date} -> {end_date}...")
         try:
@@ -734,8 +764,8 @@ class KAPDeltaEngine:
                 iso_txn_date = self._transaction_date_to_iso(txn.transaction_date)
                 if iso_txn_date is not None and iso_txn_date < start_date:
                     # Publish date is in-window, but the trade itself
-                    # predates (or falls inside) the baseline PDF month --
-                    # already reflected in that PDF. Skip to avoid
+                    # predates (or falls on) the baseline's valuation date
+                    # -- already reflected in that PDF. Skip to avoid
                     # double-counting.
                     skipped_pre_baseline += 1
                     print(
@@ -1026,7 +1056,7 @@ def collect_global_baseline(
     related_funds: List[str],
     days_back: int = 365,
     execution_logs: Optional[List[Dict[str, str]]] = None,
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Tuple[int, int]]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, AsOfResolution]]:
     """Orchestrates `kap_downloader.KAPPdfDownloader` + `kap_pdf_parser.
     KAPPdfParser` across every fund code in `related_funds` (typically
     `KAPDeltaEngine.discover_related_funds()`'s output) to build a single
@@ -1040,8 +1070,8 @@ def collect_global_baseline(
 
     "Date Lag" fix (2026-07-31): each fund now uses `KAPPdfDownloader.
     download_latest_report()` to find and download ITS OWN most recently
-    published monthly "Portfoy Dagilim Raporu" -- there is no shared,
-    externally-supplied `baseline_period` anymore. Funds legitimately
+    published "Portfoy Dagilim Raporu" -- there is no shared,
+    externally-supplied baseline period anymore. Funds legitimately
     publish on different schedules (e.g. TLY's latest report might be
     June 2026 while DOH's is May 2026), so forcing every fund onto the
     SAME period (as this function used to do, taking it from whatever the
@@ -1065,19 +1095,25 @@ def collect_global_baseline(
     (2026-07-30) by probing 30/90/180/365/366/400, where 365 returned 13
     TLY disclosures and 366+ returned 0.
 
-    Returns a 2-tuple `(global_baseline, baseline_periods)`, where
-    `baseline_periods` maps each successfully baselined fund code to the
-    `(year, donem)` tuple of the report that was actually used, e.g.
-    `{"TLY": (2026, 6), "DOH": (2026, 5)}` -- funds can legitimately
-    differ here, by design.
+    Returns a 2-tuple `(global_baseline, baseline_dates)`, where
+    `baseline_dates` maps each successfully baselined fund code to the
+    `AsOfResolution` describing WHEN that fund's report was valued, e.g.
+    `{"TLY": <as_of 2026-09-04>, "THF": <as_of 2026-08-31>}`. Funds
+    legitimately differ here, and since 2026-09 they also differ in
+    CADENCE -- TLY/TMV/DOH file weekly ("HB") while THF/FSU still file
+    monthly ("AB") -- which is precisely why a date is reported rather
+    than a period label.
 
     Never raises and never aborts the loop: a fund missing from
     `KAPPdfDownloader.KNOWN_FUNDS` (no registered KAP OID -- true today
-    for every discovered fund except TLY itself), a download failure, or
-    an empty/missing parse result for its latest period are all caught,
+    for every discovered fund except TLY itself), a download failure, an
+    empty/missing parse result, or a report whose as-of date cannot be
+    established from its data (`ReportDatingError`) are all caught,
     logged as "[UYARI]", and treated as "skip this fund, keep going" --
     the returned dicts simply omit that fund's entry rather than crashing
-    or fabricating data for it.
+    or fabricating data for it. An undatable report is skipped rather
+    than given an assumed month-end date, because a wrong baseline date
+    silently double-counts deltas instead of failing visibly.
 
     `execution_logs` (optional, default None): a shared list (see
     `_log_step`) that this function appends short narrative entries to --
@@ -1086,12 +1122,18 @@ def collect_global_baseline(
     this function's return value or behavior.
     """
     global_baseline: Dict[str, Dict[str, float]] = {}
-    baseline_periods: Dict[str, Tuple[int, int]] = {}
+    baseline_dates: Dict[str, AsOfResolution] = {}
 
     print(
         f"\n[SISTEM] Global Baseline Toplama Basladi: {len(related_funds)} fon "
         "(her fon KENDI en guncel raporunu kullanacak)."
     )
+
+    # Dating a report needs the fund's own TEFAS daily series (see
+    # `report_dating`). Fetched once, up front, for every fund in the list:
+    # since the v5.3 bulk rewrite one all-funds request serves them all, so
+    # this costs ~2 requests rather than one per fund.
+    tefas_records = load_tefas_records(related_funds)
     _log_step(
         execution_logs,
         f"Global baseline toplama başlıyor: hedef_fon_listesi={related_funds}, "
@@ -1124,20 +1166,27 @@ def collect_global_baseline(
             )
             continue
 
-        period_key = f"{download_result['year']}_{download_result['donem']:02d}"
-        pdf_name = f"{fon_kodu}_{download_result['year']}_{download_result['donem']:02d}.pdf"
+        period_key = download_result["period_slug"]
+        pdf_name = download_result["file"]
+        pdf_path = os.path.join(output_dir, pdf_name)
 
         try:
-            validity = baseline_period_end_date(int(download_result["year"]), int(download_result["donem"]))
-        except (ValueError, TypeError) as exc:
-            # A single fund's unusable period tag must never abort a loop
-            # over several funds -- skip it the same way a failed download
-            # or an empty parse is skipped.
-            print(f"[UYARI] [{fon_kodu}] Dönem bilgisi kullanilamaz, atlaniyor: {exc}")
+            resolution = date_baseline_report(
+                fon_kodu,
+                pdf_path,
+                tefas_records.get(fon_kodu, []),
+                execution_logs=execution_logs,
+            )
+        except ReportDatingError as exc:
+            # The report's own data doesn't pin it to a date. Skipped
+            # rather than assumed: an assumed (month-end) date is what
+            # silently double-counted every delta between that date and
+            # the report's real one.
+            print(f"[UYARI] [{fon_kodu}] Rapor tarihi veriden dogrulanamadi, atlaniyor: {exc}")
             _log_step(
                 execution_logs,
                 f"Global baseline RED: fon={fon_kodu}, PDF={pdf_name}, "
-                f"geçersiz dönem={download_result.get('donem')!r}, hata={exc}.",
+                f"dönem={download_result.get('period_label')!r}; rapor tarihi doğrulanamadı: {exc}",
             )
             continue
 
@@ -1162,12 +1211,16 @@ def collect_global_baseline(
             continue
 
         global_baseline[fon_kodu] = holdings
-        baseline_periods[fon_kodu] = (download_result["year"], download_result["donem"])
-        print(f"[BASARILI] [{fon_kodu}] {period_key} (EN GUNCEL) baseline'i toplandi ({len(holdings)} hisse kodu).")
+        baseline_dates[fon_kodu] = resolution
+        print(
+            f"[BASARILI] [{fon_kodu}] {download_result['period_label']} baseline'i toplandi "
+            f"({len(holdings)} hisse kodu, veri tarihi {_format_tr_date(resolution.as_of)})."
+        )
         _log_step(
             execution_logs,
-            f"Global baseline OK: fon={fon_kodu}, PDF='{pdf_name}', dönem={period_key}, "
-            f"geçerlilik_sonu={_format_tr_date(validity)}, hisse_kodu_sayısı={len(holdings)}, "
+            f"Global baseline OK: fon={fon_kodu}, PDF='{pdf_name}', dönem={period_key} "
+            f"({download_result.get('cadence') or 'ritim bilinmiyor'}), "
+            f"geçerlilik_sonu={_format_tr_date(resolution.as_of)}, hisse_kodu_sayısı={len(holdings)}, "
             f"örnek_kodlar={sorted(holdings)[:8]}.",
         )
 
@@ -1182,7 +1235,7 @@ def collect_global_baseline(
         f"fonlar={sorted(global_baseline)}, benzersiz_hisse={len(all_tickers)}, "
         f"atlanan={ [c for c in related_funds if c not in global_baseline] }.",
     )
-    return global_baseline, baseline_periods
+    return global_baseline, baseline_dates
 
 
 # --- Step 3: daily TEFAS "buying power" (equity TL exposure) per fund -------
@@ -1634,59 +1687,75 @@ if __name__ == "__main__":
     parser = KAPPdfParser()
     history = parser.parse_directory("tly_pdfs")
 
-    latest_period = f"{tly_latest['year']}_{tly_latest['donem']:02d}"
+    latest_period = tly_latest["period_slug"]
     baseline_data = history.get(latest_period) or {}
-    baseline_pdf_name = f"{FON_KODU}_{tly_latest['year']}_{int(tly_latest['donem']):02d}.pdf"
+    baseline_pdf_name = tly_latest["file"]
+    baseline_pdf_path = os.path.join("tly_pdfs", baseline_pdf_name)
 
     if not baseline_data:
         raise SystemExit(
             f"'{latest_period}' donemi indirildi ama ayristirilan veri bos donuyor; durduruluyor."
         )
 
-    baseline_year = int(tly_latest["year"])
-    baseline_donem = int(tly_latest["donem"])
-
+    # The baseline's validity date comes from the PDF's own figures, never
+    # from its period label -- see `date_baseline_report` and
+    # `report_dating` for the weekly-disclosure change that made every
+    # label unusable. Refusing to run beats running on a guessed date:
+    # a date that is too early double-counts, and does so invisibly.
     try:
-        baseline_end = baseline_period_end_date(baseline_year, baseline_donem)
-    except (ValueError, TypeError) as exc:
+        baseline_dating = date_baseline_report(
+            FON_KODU,
+            baseline_pdf_path,
+            load_tefas_records([FON_KODU]).get(FON_KODU, []),
+            parser=parser,
+            execution_logs=execution_logs,
+        )
+    except ReportDatingError as exc:
         raise SystemExit(
-            f"'{FON_KODU}' baseline raporunun dönemi çözümlenemedi; durduruluyor. {exc}"
+            f"'{FON_KODU}' baseline raporunun veri tarihi doğrulanamadı; durduruluyor "
+            f"(tahmini bir tarihle devam etmek deltaları çift sayardı). {exc}"
         ) from exc
+
+    baseline_end = baseline_dating.as_of
 
     _log_step(
         execution_logs,
-        f"Taban veri '{baseline_pdf_name}' olarak tespit edildi. Dönem={latest_period}, "
-        f"geçerlilik tarihi ayın son günü olan {_format_tr_date(baseline_end)} olarak atandı "
-        f"(calendar.monthrange({baseline_year}, {baseline_donem})). "
+        f"Taban veri '{baseline_pdf_name}' olarak tespit edildi. KAP dönemi={latest_period} "
+        f"({tly_latest.get('cadence') or 'ritim bilinmiyor'}, yayın={tly_latest.get('publish_date')}). "
+        f"Geçerlilik tarihi PDF'in KENDİ verisinden {_format_tr_date(baseline_end)} olarak "
+        f"belirlendi (dönem etiketinden DEĞİL). "
         f"Parse edilen hisse kodu sayısı={len(baseline_data)}. "
         f"Örnek kodlar={sorted(baseline_data)[:10]}.",
     )
 
     print("=== KAPDeltaEngine + KAPPdfParser Entegre Test ===")
-    print(f"Baseline donemi: {latest_period}  ({len(baseline_data)} kod)\n")
+    print(
+        f"Baseline: {tly_latest.get('period_label')}  ({len(baseline_data)} kod)  "
+        f"veri tarihi {_format_tr_date(baseline_end)}\n"
+    )
 
-    # Double-counting fix: the monthly PDF for (year, donem) already
-    # contains holdings as of that month's LAST day. Delta must open on
-    # the next calendar day -- NOT "today - 30 days", which previously
-    # re-applied trades already baked into the baseline PDF.
-    start = baseline_period_to_delta_start(baseline_year, baseline_donem)
+    # Double-counting guard: the PDF already contains every trade up to and
+    # including its valuation date, so the delta window opens the day
+    # after. That date is now MEASURED (see above) rather than assumed to
+    # be a month end -- for a weekly report the month end is up to a week
+    # too early, which re-applied trades the PDF already held.
+    start = baseline_dating.delta_start
     end = date.today()
     if start > end:
         raise SystemExit(
-            f"Baseline donemi {baseline_donem:02d}/{baseline_year} henuz bitmemis "
-            f"(delta baslangici {start.isoformat()} bugunden ({end.isoformat()}) sonra); "
-            "delta araligi bos -- once sonraki ayin basini bekleyin ya da daha eski bir "
-            "baseline donemi kullanin."
+            f"Baseline veri tarihi ({_format_tr_date(baseline_end)}) bugunden sonra "
+            f"(delta baslangici {start.isoformat()} > {end.isoformat()}); delta araligi bos. "
+            "Bu normalde olamaz -- rapor tarihlemesini (report_dating) kontrol edin."
         )
     print(
         f"[SISTEM] Delta araligi: {start.isoformat()} -> {end.isoformat()} "
-        f"(baseline PDF {baseline_donem:02d}/{baseline_year} ayinin son gununden ertesi gun)\n"
+        f"(baseline verisinin degerlendigi {_format_tr_date(baseline_end)} gununun ertesi)\n"
     )
     _log_step(
         execution_logs,
         f"Delta penceresi hesaplandı: start_date={start.isoformat()} "
         f"({_format_tr_date(start)}), end_date={end.isoformat()} ({_format_tr_date(end)}). "
-        f"Kural: start_date = baseline_period_end({_format_tr_date(baseline_end)}) + 1 gün. "
+        f"Kural: start_date = baseline_veri_tarihi({_format_tr_date(baseline_end)}) + 1 gün. "
         f"'{baseline_pdf_name}' içindeki {_format_tr_date(baseline_end)} ve öncesi "
         "günlük bildirimler işleme ALINMAYACAK (double-counting koruması).",
     )
@@ -1726,8 +1795,10 @@ if __name__ == "__main__":
     print("\n=== Adım 2: Global Baseline Toplama ===")
     # Her fon artik KENDI en guncel raporunu kullaniyor (bkz.
     # collect_global_baseline'in guncellenmis docstring'i) -- tek, ortak
-    # bir baseline_period ZORLANMIYOR.
-    global_baseline, baseline_periods = collect_global_baseline(
+    # bir dönem ZORLANMIYOR. Fonlar artik ayni RITIMDE de olmayabilir
+    # (bazilari haftalik, bazilari aylik bildiriyor), bu yuzden ozet dönem
+    # etiketi degil VERI TARIHI gosterir.
+    global_baseline, baseline_dates = collect_global_baseline(
         related_funds_target_array, execution_logs=execution_logs
     )
     print("\n=== Global Baseline Özeti ===")
@@ -1736,9 +1807,9 @@ if __name__ == "__main__":
         if holdings is None:
             print(f"  {fund_code:8s}  -> VERI YOK (atlandi)")
         else:
-            period = baseline_periods.get(fund_code)
-            period_label = f"{period[1]:02d}/{period[0]}" if period else "?"
-            print(f"  {fund_code:8s}  -> {len(holdings)} hisse kodu  (donem: {period_label})")
+            dating = baseline_dates.get(fund_code)
+            date_label = _format_tr_date(dating.as_of) if dating else "?"
+            print(f"  {fund_code:8s}  -> {len(holdings)} hisse kodu  (veri tarihi: {date_label})")
 
     print("\n=== Adım 3: TEFAS Günlük Aktif Güç Matrisi ===")
     # BUG FIX (2026-07-30): Adım 2'de KAP PDF baseline'ı bulunamayan fonlar
@@ -1900,6 +1971,11 @@ if __name__ == "__main__":
         delta_report={
             "fon_kodu": FON_KODU,
             "baseline_period": latest_period,
+            # The KAP label above is not a date; these two are. The report
+            # states them explicitly so a reader can see which window the
+            # deltas actually cover (see `date_baseline_report`).
+            "baseline_as_of": baseline_dating.as_of,
+            "baseline_delta_start": baseline_dating.delta_start,
             "baseline_data": baseline_data,
             "resolved": resolved_plain,
             "unresolved": unresolved_plain,
