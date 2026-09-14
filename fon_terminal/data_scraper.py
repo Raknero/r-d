@@ -987,17 +987,26 @@ def general_map_has_changes(entry, general_map):
 
     Both new dates and REVISED values for an already-stored date count as
     changes, as does a stored record that never got a distribution key at
-    all -- an empty `Varliklar` is legitimate for qualified/closed funds, a
-    missing one means we simply never fetched it.
+    all. An empty `Varliklar` is only treated as "already fetched" when
+    this fund has never published a breakdown (qualified/closed funds).
+    If the fund HAS distribution on other dates, an empty day is a hole --
+    TEFAS often publishes price/AUM first and the allocation later the
+    same day -- and must retrigger the distribution request rather than
+    being frozen in by the no-op.
     """
     stored = {
         record.get("Tarih"): record
         for record in (entry or {}).get("records") or []
     }
+    fund_publishes_distribution = any(
+        (record.get("Varliklar") or {}) for record in stored.values()
+    )
 
     for date_str, info in general_map.items():
         existing = stored.get(date_str)
         if existing is None or "Varliklar" not in existing:
+            return True
+        if fund_publishes_distribution and not (existing.get("Varliklar") or {}):
             return True
         for key in ("Pay", "Yatirimci"):
             if existing.get(key) != info.get(key):
@@ -1097,6 +1106,14 @@ def upsert_fund_record(database, fund_code, new_record):
     )
 
     if existing_index > -1:
+        existing = records[existing_index]
+        incoming_varliklar = new_record.get("Varliklar") or {}
+        existing_varliklar = existing.get("Varliklar") or {}
+        # TEFAS can return price/AUM for a day whose allocation is not
+        # out yet. Never clobber a real breakdown with that empty placeholder.
+        if not incoming_varliklar and existing_varliklar:
+            new_record = dict(new_record)
+            new_record["Varliklar"] = existing_varliklar
         records[existing_index] = new_record
         action = "updated"
     else:

@@ -715,6 +715,19 @@
         let reportHTML = `<div class="report-box">
             <h3>📈 Günlük Fon Yöneticisi Hamleleri (${prev.Tarih} ➔ ${last.Tarih})</h3>
             <ul>`;
+
+        const lastHasDist = last.Varliklar && Object.keys(last.Varliklar).length > 0;
+        const prevHasDist = prev.Varliklar && Object.keys(prev.Varliklar).length > 0;
+        if (!lastHasDist) {
+            reportHTML += `<li>Bugünün (${last.Tarih}) varlık dağılımı henüz TEFAS'ta yayınlanmamış. Fiyat ve pay verisi var; dağılım geldiğinde bu özet dolacak. Boş dağılım %0 satışı olarak yorumlanmaz.</li></ul></div>`;
+            reportDiv.innerHTML = reportHTML;
+            return;
+        }
+        if (!prevHasDist) {
+            reportHTML += `<li>Bir önceki günün (${prev.Tarih}) varlık dağılımı eksik olduğu için günlük değişim hesaplanamadı.</li></ul></div>`;
+            reportDiv.innerHTML = reportHTML;
+            return;
+        }
         
         const allAssets = new Set([...Object.keys(last.Varliklar || {}), ...Object.keys(prev.Varliklar || {})]);
         let changedAssets = [];
