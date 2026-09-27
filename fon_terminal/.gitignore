@@ -4,3 +4,6 @@ tefas_debug.html
 
 # Tamamen lokal, gizli geliştirici mimari notu -- Git ile ASLA takip edilmemeli.
 INTERNAL_ARCHITECTURE.md
+
+# Vaka çalışmasının kişisel sürümü (işlemler, tutarlar, KAP PDF kopyaları) -- Git ile ASLA takip edilmemeli.
+case_study/private/
