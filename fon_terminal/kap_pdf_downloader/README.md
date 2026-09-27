@@ -1,5 +1,10 @@
 # KAP PDF Downloader & Parser (Sandbox)
 
+This sandbox is the holdings half of the same question the
+[terminal](../README.md) asks: **what does the fund actually hold, and
+how concentrated is it?** What those reports showed before September 2026
+is in the [case study](../case_study/CASE_STUDY_2026_09.md).
+
 Standalone, isolated module for downloading a Turkish investment fund's
 "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF
 attachments from KAP (Kamuyu Aydinlatma Platformu / Public Disclosure
@@ -73,14 +78,15 @@ the same two fields are simply reused with different meanings:
 | Field | Monthly filing | Weekly filing |
 |---|---|---|
 | `period` | `"AB"` | `"HB"` |
-| `donem` | month (1..12) | ISO week of year (e.g. `34`, `35`) |
+| `donem` | month (1..12) | KAP's week ordinal as filed (e.g. `34`, `35`) — not an ISO week, and not a date |
 
 Neither the attachment filename nor the PDF's own header was updated by
 the filers. TLY's report published **09.09.2026** arrives as
 `donem=35, period="HB"`, is attached as `TLY_2026.08.pdf`, and page 1
 still reads **"Ağustos-2026"** -- while its holdings are valued
-**04.09.2026**. The figures inside are correct; only every label around
-them is wrong.
+**04.09.2026**. ISO week 35 of 2026 ended 30.08; TLY's `HB35` is later
+than that, so the ordinal is KAP's filing number, not a calendar week.
+The figures inside are correct; only every label around them is wrong.
 
 #### Two separate bugs this caused
 
@@ -359,9 +365,13 @@ current directory for visual verification.
 **Optional delta sections (2026-07-28, extended through 2026-08-03):**
 `export_to_html` also accepts an optional `delta_report` dict (produced by
 `kap_delta_engine.py` -- see below), shaped as `{"fon_kodu",
-"baseline_period", "baseline_data", "resolved", "unresolved",
+"baseline_period", "baseline_as_of", "baseline_delta_start",
+"baseline_data", "resolved", "unresolved",
 "proportionally_resolved", "updated_data", "tefas_power_matrix",
-"execution_logs"}`. When provided, the SAME `parser_kontrol_raporu.html`
+"current_prices", "current_aum", "current_aum_date",
+"execution_logs"}`. `baseline_period` is the KAP filing label (not a
+date); `baseline_as_of` / `baseline_delta_start` are the measured
+valuation window from `report_dating.py`. When provided, the SAME `parser_kontrol_raporu.html`
 file gets extended with, in order:
 
 1. **"Adım Adım Hesaplama ve Çalışma Günlüğü" (Execution Trace)** -- a
@@ -739,7 +749,7 @@ tefas_power_matrix = build_tefas_power_matrix(related_funds_target_array, days_b
 **Bridging out of the sandbox, on purpose:** this is the one place in
 `kap_pdf_downloader/` that intentionally imports `fon_terminal/
 data_scraper.py` (via a lazy `sys.path` bridge) -- TEFAS AUM/distribution
-data only exists there, and reimplementing its Playwright WAF-bypass logic
+data only exists there, and reimplementing its TEFAS session handshake
 here would be a maintenance hazard. `data_scraper.DATABASE_FILE` is
 redirected to a sandbox-local `tefas_cache.json` (gitignored) for the
 duration of the call, so this exploratory pipeline can never write an
