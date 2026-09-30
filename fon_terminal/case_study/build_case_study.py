@@ -58,7 +58,7 @@ COLLAPSE_DAILY_DROP_PCT = -5.0
 SIGNALS = {
     "whale": "Whale day (shares -2%+, investors flat/up)",
     "borrow": "Repo borrowing <= -5% of NAV",
-    "drain": "Silent drain (shares -15%/20d, price > -3%)",
+    "drain": "Share drain (shares -15%/20d, price held)",
     "net_liquidity": "Net liquidity < 0",
 }
 SIGNAL_COLORS = {"whale": "#8e44ad", "borrow": "#d35400", "drain": "#2c7fb8", "net_liquidity": "#c0392b"}
@@ -166,14 +166,17 @@ def style_axis(ax):
 def fund_panel(fund, rows, summary, output_path, trades=None):
     rows = [r for r in rows if r["date"] >= CHART_START]
     dates = [r["date"] for r in rows]
-    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True,
-                             gridspec_kw={"height_ratios": [1.3, 1, 1]})
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10.2), sharex=True,
+                             gridspec_kw={"height_ratios": [1.35, 1, 1]})
 
     ax = axes[0]
-    ax.plot(dates, index_series(rows, "price"), color="#222222", linewidth=2, label="Unit price")
-    ax.plot(dates, index_series(rows, "shares"), color="#2c7fb8", linewidth=2, label="Shares outstanding")
-    ax.set_ylabel(f"Index ({INDEX_BASE_DATE:%d.%m} = 100)")
-    ax.set_title(f"{fund}: price vs. shares outstanding, balance-sheet liquidity, daily flows", loc="left")
+    ax.plot(dates, index_series(rows, "price"), color="#222222", linewidth=2.2, label="Unit price")
+    ax.plot(dates, index_series(rows, "shares"), color="#2c7fb8", linewidth=2.2, label="Shares outstanding")
+    ax.set_ylabel(f"Price & shares\n({INDEX_BASE_DATE:%d.%m} = 100)")
+    ax.set_title(
+        f"{fund} — did the price still look fine while the fund was shrinking?",
+        loc="left", fontsize=12, pad=8,
+    )
 
     if trades:
         price_index = dict(zip(dates, index_series(rows, "price")))
@@ -196,21 +199,23 @@ def fund_panel(fund, rows, summary, output_path, trades=None):
 
     liquidity = [sane(r["net_liquidity"]) for r in rows]
     repo = [sane(r["repo"]) for r in rows]
-    ax.plot(dates, liquidity, color="#1a9850", linewidth=2, label="Net liquidity (% NAV)")
-    ax.plot(dates, repo, color="#d35400", linewidth=1.5, linestyle="--", label="Repo borrowing (% NAV)")
+    ax.plot(dates, liquidity, color="#1a9850", linewidth=2.2, label="Net liquidity (cash-like minus repo)")
+    ax.plot(dates, repo, color="#d35400", linewidth=1.8, linestyle="--", label="Repo borrowing")
     ax.axhline(0, color="#555555", linewidth=0.8)
     ax.set_ylim(-60, 35)
-    ax.set_ylabel("% of NAV (clipped)")
+    ax.set_ylabel("% of NAV")
+    ax.set_title("Was there still a cash buffer, or was the fund already borrowing?", loc="left", fontsize=10)
 
     ax = axes[2]
     width = 0.4
     ax.bar([d - timedelta(hours=5) for d in dates], [max(r["share_chg"], -20) for r in rows], width=width,
-           color="#2c7fb8", label="Shares, daily %")
+           color="#2c7fb8", label="Shares outstanding, that day")
     ax.bar([d + timedelta(hours=5) for d in dates], [max(r["investor_chg"], -20) for r in rows], width=width,
-           color="#bbbbbb", label="Investors, daily %")
+           color="#bbbbbb", label="Investor count, that day")
     ax.axhline(0, color="#555555", linewidth=0.8)
     ax.set_ylim(-20, 8)
-    ax.set_ylabel("Daily change % (clipped)")
+    ax.set_ylabel("Daily %")
+    ax.set_title("Who left: a drop in shares with a flat investor count is large holders", loc="left", fontsize=10)
 
     for ax in axes:
         style_axis(ax)
@@ -232,9 +237,15 @@ def fund_panel(fund, rows, summary, output_path, trades=None):
     if summary["collapse"]:
         handles.append(plt.Line2D([], [], color="black", linewidth=1.8))
         labels.append(f"Collapse / suspension ({summary['collapse']:%d.%m})")
-    fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0, 0.12, 1, 1))
-    fig.savefig(output_path, dpi=130)
+    fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=9, frameon=False)
+    fig.text(
+        0.5, 0.005,
+        "Dotted lines: first day each rule fired. Solid black: collapse or suspension. "
+        "Clipped axes hide NAV% that explode once the price is near zero.",
+        ha="center", fontsize=8, color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0.14, 1, 0.99))
+    fig.savefig(output_path, dpi=140)
     plt.close(fig)
 
 
@@ -307,14 +318,15 @@ def concentration_chart(snapshots, output_path):
     ax.set_xticks([x + width * (len(labels) - 1) / 2 for x in range(len(order))])
     ax.set_xticklabels(order)
     ax.set_ylabel("% of fund NAV")
-    ax.set_title("TLY: largest single-stock positions (KAP portfolio reports)", loc="left")
+    ax.set_title("TLY — how much sat in the largest names (from KAP reports, not TEFAS)", loc="left", fontsize=12)
+    ax.set_xlabel("Ticker")
     style = ax.spines
     style["top"].set_visible(False)
     style["right"].set_visible(False)
     ax.grid(True, axis="y", color="#e5e5e5")
     ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=130)
+    fig.savefig(output_path, dpi=140)
     plt.close(fig)
 
 

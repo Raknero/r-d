@@ -1499,12 +1499,21 @@ def build_tefas_power_matrix(
 # --- Step 6: live BIST prices + target fund AUM, for a "% of portfolio" weight -----
 
 
-def fetch_bist_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
-    """Fetches the latest available closing price (TL) for a batch of
-    BIST-listed tickers via `yfinance`, for the portfolio evolution
-    table's "Güncel Ağırlık (%)" column: `Hisse Pozisyon Büyüklüğü =
-    Güncel Tahmini Lot * Güncel Fiyat`, then that position size as a
-    percentage of the target fund's total AUM (see `get_latest_aum_for_fund`).
+def fetch_bist_prices(
+    tickers: List[str],
+    as_of: Optional[date] = None,
+) -> Dict[str, Optional[float]]:
+    """Fetches closing prices (TL) for a batch of BIST-listed tickers via
+    `yfinance`, for the portfolio evolution table's "Güncel Ağırlık (%)"
+    column: `Hisse Pozisyon Büyüklüğü = Güncel Tahmini Lot * Güncel Fiyat`,
+    then that position size as a percentage of the target fund's total AUM
+    (see `get_latest_aum_for_fund`).
+
+    If `as_of` is set, the close is the last session on or before that
+    date — not whatever Yahoo is printing today. After 16.09.2026 these
+    funds stopped publishing a real NAV; live TEFAS/BIST prints are not
+    the last operating book. The TLY `__main__` pipeline passes that
+    cutoff. `as_of=None` keeps the old "latest 5d bar" behaviour.
 
     Yahoo Finance requires a ".IS" suffix for Istanbul-listed symbols
     (e.g. "PEKGY" -> "PEKGY.IS") -- added here, transparently, so callers
@@ -1543,16 +1552,26 @@ def fetch_bist_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
     symbol_map = {f"{ticker}.IS": ticker for ticker in tickers}
     symbols = list(symbol_map.keys())
 
-    print(f"[SISTEM] {len(symbols)} BIST hissesi icin guncel fiyat cekiliyor (yfinance, tek toplu istek)...")
+    window = (
+        f"as_of={as_of.isoformat()} (son seans o gun veya once)"
+        if as_of is not None
+        else "period=5d (en son bar)"
+    )
+    print(f"[SISTEM] {len(symbols)} BIST hissesi icin fiyat cekiliyor (yfinance, tek toplu istek, {window})...")
     try:
-        data = yf.download(
-            tickers=symbols,
-            period="5d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-            auto_adjust=False,
-        )
+        download_kwargs: Dict[str, object] = {
+            "tickers": symbols,
+            "group_by": "ticker",
+            "threads": True,
+            "progress": False,
+            "auto_adjust": False,
+        }
+        if as_of is not None:
+            download_kwargs["start"] = (as_of - timedelta(days=12)).isoformat()
+            download_kwargs["end"] = (as_of + timedelta(days=1)).isoformat()
+        else:
+            download_kwargs["period"] = "5d"
+        data = yf.download(**download_kwargs)
     except Exception as exc:  # noqa: BLE001 - a total yfinance/network failure must never crash the caller
         print(f"[UYARI] BIST fiyatlari cekilirken beklenmeyen hata (yfinance): {exc}")
         return prices
@@ -1574,7 +1593,7 @@ def fetch_bist_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
             close_series = close_series.dropna()
             if close_series.empty:
                 continue
-            prices[ticker] = float(close_series.iloc[-1])
+            prices[ticker] = _close_on_or_before(close_series, as_of)
         except (KeyError, IndexError, TypeError, ValueError):
             continue
 
@@ -1589,13 +1608,40 @@ def fetch_bist_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
     return prices
 
 
-def get_latest_aum_for_fund(fon_kodu: str) -> Optional[Tuple[str, float]]:
+def _close_on_or_before(close_series, as_of: Optional[date]) -> Optional[float]:
+    """Last non-null close in `close_series`, or the last one whose session
+    date is on or before `as_of` when that cutoff is set."""
+    if as_of is None:
+        return float(close_series.iloc[-1])
+    chosen: Optional[float] = None
+    for idx, value in close_series.items():
+        try:
+            idx_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+            if getattr(idx_dt, "tzinfo", None) is not None:
+                idx_dt = idx_dt.replace(tzinfo=None)
+            idx_day = idx_dt.date() if hasattr(idx_dt, "date") else idx_dt
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if idx_day <= as_of:
+            chosen = float(value)
+    return chosen
+
+
+def get_latest_aum_for_fund(
+    fon_kodu: str,
+    as_of: Optional[date] = None,
+) -> Optional[Tuple[str, float]]:
     """Returns `(iso_date, ToplamDeger)` for `fon_kodu`'s most recent
     TEFAS record in this sandbox's local cache (`tefas_cache.json`) --
     the RAW total AUM figure, deliberately NOT the "Aktif Guc"
     (equity+liquidity) figure `build_tefas_power_matrix` computes, since
     the evolution table's "% of portfolio" weight needs the fund's TRUE
     total size as its denominator, not a purchasing-power subset of it.
+
+    Rows with `Fiyat <= 0` are skipped (a suspended fund prints 0, which
+    is not an AUM). If `as_of` is set, later cache rows are ignored too —
+    same cutoff as `fetch_bist_prices`, so weights stay on the last
+    operating session.
 
     Must be called AFTER `build_tefas_power_matrix` has run at least once
     for this fund in the current process -- that call is what populates
@@ -1627,11 +1673,21 @@ def get_latest_aum_for_fund(fon_kodu: str) -> Optional[Tuple[str, float]]:
 
     latest_iso: Optional[str] = None
     latest_aum: Optional[float] = None
+    as_of_iso = as_of.isoformat() if as_of is not None else None
     for record in records:
         iso_date = _tarih_ddmmyyyy_to_iso(record.get("Tarih"))
         raw_aum = record.get("ToplamDeger")
         if iso_date is None or raw_aum is None:
             continue
+        if as_of_iso is not None and iso_date > as_of_iso:
+            continue
+        raw_price = record.get("Fiyat")
+        if raw_price is not None:
+            try:
+                if float(raw_price) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
         if latest_iso is not None and iso_date <= latest_iso:
             continue
         try:
@@ -1862,22 +1918,28 @@ if __name__ == "__main__":
         print(f"{code:8s}  Onceki: {before:>15,.2f}   Delta: {delta:>+15,.2f}   Sonraki: {after:>15,.2f}")
 
     print("\n=== Adım 6: Güncel BIST Fiyatları ve Portföy Ağırlığı (%) ===")
+    # Last session these funds still published a real NAV. After 16.09
+    # TEFAS prints 0 and many names are halted; live Yahoo closes are not
+    # the last operating book.
+    LAST_OPERATING_SESSION = date(2026, 9, 16)
     yf_symbols = [f"{code}.IS" for code in all_codes]
     _log_step(
         execution_logs,
-        f"yfinance toplu fiyat isteği: tickers={yf_symbols}, period='5d', "
+        f"yfinance toplu fiyat isteği: tickers={yf_symbols}, "
+        f"as_of={LAST_OPERATING_SESSION.isoformat()} (son seans, period=5d değil), "
         f"group_by='ticker', ham_kod_sayısı={len(all_codes)}.",
     )
-    current_prices = fetch_bist_prices(all_codes)
+    current_prices = fetch_bist_prices(all_codes, as_of=LAST_OPERATING_SESSION)
     found_price_count = sum(1 for price in current_prices.values() if price is not None)
     missing_price_codes = [code for code, price in current_prices.items() if price is None]
     _log_step(
         execution_logs,
         f"yfinance yanıtı: fiyat_bulunan={found_price_count}/{len(all_codes)}, "
-        f"fiyat_yok={missing_price_codes or '[]'}.",
+        f"fiyat_yok={missing_price_codes or '[]'}, "
+        f"kesim={LAST_OPERATING_SESSION.isoformat()}.",
     )
 
-    aum_info = get_latest_aum_for_fund(FON_KODU)
+    aum_info = get_latest_aum_for_fund(FON_KODU, as_of=LAST_OPERATING_SESSION)
     if aum_info is None:
         print(f"[UYARI] {FON_KODU} icin tefas_cache.json'da guncel ToplamDeger (AUM) bulunamadi; agirlik (%) hesabi atlanacak.")
         _log_step(

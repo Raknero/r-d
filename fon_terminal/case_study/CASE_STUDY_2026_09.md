@@ -45,6 +45,20 @@ said nothing until it was too late.
 | **Allocation charts** (repo, reverse repo, money market, deposits) | *Is there a buffer?* How much of the fund can be turned into cash immediately, and is the fund already borrowing? |
 | **KAP pipeline** (`kap_pdf_downloader/`) | *What does the fund actually hold?* Stock-level holdings from the fund's own KAP portfolio reports; single-stock concentration; which funds share a manager (`discover_related_funds`). |
 
+The terminal on 16.09, last published TEFAS row before the halt — price and AUM still look fine; shares and reverse-repo are already falling:
+
+![TLY terminal 16.09.2026](img/tly_terminal_2026_09_16.png)
+
+*Same dashboard as the terminal README. 17.09 (zero price / suspension, alerts) is in section 7.*
+
+The KAP HTML report, frozen at the last operating session. After 16.09, TEFAS prints 0 and BIST names are not a usable "current weight". These shots are from an earlier run (AUM header 26.08); they show the product, not a live post-liquidation refresh.
+
+![KAP execution trace](img/kap_report_overview.png)
+
+![KAP holdings](img/kap_report_holdings.png)
+
+![KAP portfolio evolution](img/kap_report_evolution.png)
+
 The two halves were developed separately on purpose: the terminal was the
 working system, the KAP pipeline was under active development, and the plan
 was to merge them once the KAP side was stable, then add an alerting layer on
@@ -71,7 +85,7 @@ every tracked fund:
 | Signal | Rule | What it means |
 |---|---|---|
 | Whale day | Shares outstanding -2% or more in a day while investor count is flat or rising (>= -0.5%) | Large holders leaving while small ones stay or arrive |
-| Silent drain | Shares -15% or more over 20 business days while price is down less than 3% | Money leaving a fund whose price still looks healthy |
+| Share drain | Shares -15% or more over 20 business days while price is down less than 3% | Money leaving a fund whose price still looks healthy |
 | Repo borrowing | Repo at or below -5% of NAV | The fund is borrowing, typically to meet redemptions |
 | Net liquidity < 0 | Repo + reverse repo + money market + deposits below zero | Cash-like assets no longer cover what the fund owes short term |
 
@@ -84,6 +98,8 @@ they **were** written after the event; see the limitations in section 6.
 ### 4.1 PHE and PBR: the fund was emptying while the price stood still
 
 ![PHE panel](img/phe_panel.png)
+
+*Three stacked views, 16.07–collapse. Top: unit price vs shares outstanding (both indexed to 16.07 = 100). Middle: cash-like assets minus repo borrowing. Bottom: that day's change in shares (blue) vs investor count (grey). Dotted lines are the first fire of each rule; solid black is the break.*
 
 | 16.07 to 01.09 (last day before the price broke) | PHE | PBR |
 |---|---|---|
@@ -103,9 +119,13 @@ they **were** written after the event; see the limitations in section 6.
 
 ![PBR panel](img/pbr_panel.png)
 
+*Same layout as PHE. Shares and liquidity moved for weeks; the unit price was the last series to break.*
+
 ### 4.2 TLY: a rising price over a thinning cushion
 
 ![TLY panel](img/tly_panel.png)
+
+*Same three views. Price rises while shares fall and net liquidity crosses below zero on 08.09. The black line is 16.09 / suspension.*
 
 | 16.07 to 16.09 | TLY |
 |---|---|
@@ -129,6 +149,8 @@ they **were** written after the event; see the limitations in section 6.
 **Concentration (from the KAP reports):**
 
 ![TLY concentration](img/tly_concentration.png)
+
+*Each group is one KAP snapshot. Bars are that stock's weight in TLY's NAV. The last group is an estimate: 04.09 lots marked at 15.09 closes.*
 
 | Snapshot | Top holding | Top 3 | Top 5 |
 |---|---|---|---|
@@ -173,7 +195,7 @@ disclosures don't provide.
 First day each rule fired (visible date) and business days before the
 collapse (first daily price drop of 5% or more, or suspension):
 
-| Fund | Whale day | Silent drain | Repo borrowing | Net liquidity < 0 | Collapse |
+| Fund | Whale day | Share drain | Repo borrowing | Net liquidity < 0 | Collapse |
 |---|---|---|---|---|---|
 | PHE | 23.07 (29) | 03.08 (22) | 05.08 (20) | 05.08 (20) | 02.09 |
 | PBR | 29.07 (25) | 03.08 (22) | 05.08 (20) | 05.08 (20) | 02.09 |
@@ -248,7 +270,8 @@ The alerting layer this case study argues for is small:
 
 Items 1, 2 and 4 are now on the terminal (written after this event, same
 thresholds as section 3). TLY through 17.09.2026, the first published zero
-price / suspension row, with fire dates and crossing values:
+price / suspension row, with fire dates and crossing values. 16.09 (last
+published NAV, no alerts overlay) is in section 2.
 
 ![TLY terminal 17.09.2026](img/tly_terminal_2026_09_17.png)
 

@@ -11,6 +11,13 @@ What those reports showed before September 2026 is in the
 
 ![Execution trace](img/report_overview.png)
 
+*Frozen product shot — last operating session is 16.09.2026. After that
+TEFAS prints 0 and BIST names are halted or limit-down; do not refresh
+these "current weight" columns from live Yahoo/TEFAS. The pipeline now
+caps BIST closes and TEFAS AUM at that date. The screenshots themselves
+are from an earlier HTML run (AUM header 26.08); they show the report
+layout, not a live post-liquidation book.*
+
 The HTML report opens with an execution trace: which KAP endpoints were
 called, which filings were kept or dropped, and how multi-fund trades
 were classified. Holdings parsed from a PDF:
@@ -18,7 +25,7 @@ were classified. Holdings parsed from a PDF:
 ![Holdings table](img/report_holdings.png)
 
 And the estimated holdings since that baseline — weights, lot changes, BIST
-prices:
+prices as of 16.09.2026:
 
 ![Portfolio evolution](img/report_evolution.png)
 
@@ -437,8 +444,8 @@ per ticker:
 | İşlem Tarihçesi | Click-to-expand `<details>` list of every INDIVIDUAL dated entry behind the two delta columns above (see below). |
 | Güncel Tahmini Lot | Başlangıç + Kesinleşen + Oransal. |
 | Taban Tarihinden Beri Lot Değişimi (%) | `(Güncel - Başlangıç) / Başlangıç * 100`, matte emerald if positive, matte brick-red if negative. A ticker with Başlangıç Lot == 0 (division by zero is meaningless, not just an edge case) renders `"YENİ HİSSE"` here instead, unless it also nets out to exactly 0 (rendered as a plain `-`). **This covers only the span since the baseline PDF's measured valuation date** -- it resets when the next KAP PDF becomes the new baseline; it is not a long-term trend. |
-| Güncel Fiyat | Latest BIST close from yfinance (`TICKER.IS`), or `-` if unavailable. |
-| Güncel Ağırlık (%) | `(Güncel Tahmini Lot × Güncel Fiyat) / fon AUM * 100` when both price and AUM exist; otherwise `-`. |
+| Güncel Fiyat | BIST close from yfinance (`TICKER.IS`) on the last operating session (16.09.2026), or `-` if unavailable. Not today's print. |
+| Güncel Ağırlık (%) | `(Güncel Tahmini Lot × Güncel Fiyat) / fon AUM * 100` when both price and AUM exist; otherwise `-`. AUM is the last TEFAS row on or before that same date with a positive unit price. |
 
 When AUM/prices are available, rows are sorted by **Güncel Ağırlık (%)**
 descending (largest portfolio weight first); tickers without a computable
