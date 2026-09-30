@@ -246,6 +246,12 @@ The alerting layer this case study argues for is small:
 4. Track fund **status** (active, gated, suspended, in liquidation) and
    per-fund dealing rules, and show a zero price as "suspended", not as -100%.
 
+Items 1, 2 and 4 are now on the terminal (written after this event, same
+thresholds as section 3). TLY through 17.09.2026, the first published zero
+price / suspension row, with fire dates and crossing values:
+
+![TLY terminal 17.09.2026](img/tly_terminal_2026_09_17.png)
+
 ## 8. Reproducing
 
 ```bash

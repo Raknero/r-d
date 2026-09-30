@@ -15,6 +15,8 @@ What those numbers showed before September 2026 is in the [case study](case_stud
 
 TLY as of 16.09.2026 — the last published TEFAS row before the suspension. Price and AUM still look fine; shares outstanding and reverse-repo are already falling. The charts below the table are the same window.
 
+**Alerting (added after the September 2026 case study).** The dashboard applies the four rules from that write-up — whale day, share drain while price is flat (`Pay erimesi`), repo borrowing, net liquidity below zero — with the first/last fire date and the values that crossed the threshold. Outflow plus a thinning buffer is the high-severity case. A published price of 0 is shown as suspended, not as −100%.
+
 It is a FastAPI app that keeps that database warm on every boot, lets you add or remove tracked funds from the UI, and collects TEFAS's public fund-list endpoints with retries and bulk fetches. A browser handshake runs only if those endpoints start demanding credentials again.
 
 ## Project Overview & Architecture Evolution
@@ -134,6 +136,7 @@ If the bulk request fails outright, the run deliberately does **not** fan out in
 
 **Backend (`main.py` + `data_scraper.py`)**
 - **Full-stack FastAPI app:** a single process serves the dashboard (`index.html`, `fund_database.json`) and exposes the management API — no separate static file server is needed.
+- **Case-study alerts (`signals.py`):** the four rules in the September 2026 write-up, computed in memory when serving `fund_database.json` (never written back). Added after that analysis, not before.
 - **Self-updating lifespan:** on every boot, automatically re-scrapes every fund currently shown on the UI, plus any hidden/background-tracked fund whose last scrape is 15+ days old — in the background, so the dashboard serves traffic immediately instead of waiting out the scan.
 - **Hourly background refresh:** a periodic task repeats that same scan every 60 minutes (`REFRESH_INTERVAL_MINUTES`) for as long as the server runs, so a long-lived process never drifts onto stale data between restarts.
 - **Bulk fetching — cost independent of portfolio size:** one all-funds request per endpoint serves every tracked fund, so a refresh that needs both endpoints costs ~2 requests whether 3 funds or 300 are tracked (measured 4.8s / 4 requests for a stale 11-fund window; ~0.8s / 1 request when the no-op guard skips distribution).
@@ -151,7 +154,7 @@ If the bulk request fails outright, the run deliberately does **not** fan out in
 - **Zero-touch fund management:** a "+ Yeni Fon Ekle" control lets users add a new fund directly from the UI — it POSTs to `/api/add-fund`, shows a loading state, and drops the new tab in without a full page reload.
 - **Fund removal & background tracking:** an unobtrusive "×" on each tab opens a confirmation dialog to either keep tracking a fund quietly in the background or delete it permanently.
 - **Management Panel:** a dedicated modal listing every background-tracked (UI-hidden) fund with its last scrape date, each with a one-click permanent delete action.
-- **Advanced Analytics:** KPI cards, daily share-count changes ("Balina Radarı" / Whale Radar), and an automated daily report summarizing asset allocation shifts.
+- **Alerting (post-crisis):** whale day, pay erimesi (share drain while price is flat), repo borrowing, and net liquidity < 0, with fire dates and crossing values, the same rules as the [case study](case_study/CASE_STUDY_2026_09.md). Combined outflow + buffer is high severity. A zero price is "suspended", not −100%. Added after the September 2026 analysis.
 - **Interactive Visuals:** Zebra-striped data tables with day-over-day change badges, price trend charts, and asset-type mini-charts via Chart.js.
 
 ## Tech Stack

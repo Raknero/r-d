@@ -1,5 +1,6 @@
 __pycache__/
 *.json
+!tests/fixtures/*.json
 tefas_debug.html
 
 # Tamamen lokal, gizli geliştirici mimari notu -- Git ile ASLA takip edilmemeli.

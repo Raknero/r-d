@@ -23,10 +23,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 from data_scraper import DATABASE_FILE, load_database, save_database, scrape_and_update
+from signals import annotate_records
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / DATABASE_FILE
@@ -410,8 +412,21 @@ def hard_delete_fund(fund_code: str = Query(..., min_length=2, max_length=10)):
     return {"fund_code": normalized_code, "status": "deleted"}
 
 
+@app.get("/fund_database.json")
+def annotated_fund_database():
+    """Serves the on-disk database with per-row case-study signals attached.
+
+    Signals are computed in memory and never written back to
+    `fund_database.json`. Same rules as `signals.py` / CASE_STUDY_2026_09.md.
+    """
+    database = load_database()
+    for entry in database.values():
+        if isinstance(entry, dict) and isinstance(entry.get("records"), list):
+            annotate_records(entry["records"])
+    return JSONResponse(database)
+
+
 # Mounted last (and at the root path) so it acts as a catch-all: it serves
-# index.html at "/" and fund_database.json (and any other static asset)
-# alongside it, without ever shadowing the "/api/add-fund" route registered
-# above it.
+# index.html at "/" and any other static asset alongside it, without
+# shadowing `/api/*` or `/fund_database.json` registered above.
 app.mount("/", StaticFiles(directory=str(BASE_DIR), html=True), name="static")

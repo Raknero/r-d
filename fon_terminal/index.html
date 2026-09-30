@@ -79,10 +79,38 @@
         @keyframes add-fund-spin { to { transform: rotate(360deg); } }
         .add-fund-error { color: #ef4444; font-size: 13px; font-weight: 600; min-height: 16px; margin: 6px 0 16px 2px; }
         
-        .kpi-container { display: flex; gap: 20px; margin-bottom: 25px; flex-wrap: wrap; }
+        .kpi-container { display: flex; gap: 20px; margin-bottom: 16px; flex-wrap: wrap; }
         .kpi-card { flex: 1; min-width: 250px; background: #0f172a; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); border-left: 5px solid #3b82f6; border: 1px solid #334155; border-left-width: 5px; }
         .kpi-title { font-size: 12px; color: #94a3b8; font-weight: bold; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
         .kpi-value { font-size: 22px; color: #f8fafc; font-weight: 800; font-variant-numeric: tabular-nums; }
+        .alert-bar { margin-bottom: 20px; padding: 14px 16px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; }
+        .alert-bar.severity-high { border-left: 5px solid #ef4444; }
+        .alert-bar.severity-watch { border-left: 5px solid #f59e0b; }
+        .alert-bar.severity-ok { border-left: 5px solid #334155; }
+        .alert-bar.severity-halted { border-left: 5px solid #fbbf24; }
+        .alert-bar-title { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: #94a3b8; margin-bottom: 8px; }
+        .alert-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+        .alert-item { padding: 10px 12px; border-radius: 6px; border: 1px solid #334155; background: #172033; }
+        .alert-item.whale { border-left: 4px solid #8e44ad; }
+        .alert-item.drain { border-left: 4px solid #2c7fb8; }
+        .alert-item.borrow { border-left: 4px solid #d35400; }
+        .alert-item.net_liquidity { border-left: 4px solid #c0392b; }
+        .alert-item-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; }
+        .alert-item-name { font-weight: 800; color: #e2e8f0; font-size: 13px; }
+        .alert-item-when { font-size: 12px; color: #94a3b8; }
+        .alert-item-now { font-size: 11px; font-weight: 700; color: #fbbf24; }
+        .alert-item-detail { margin: 6px 0 0; font-size: 12.5px; color: #cbd5e1; line-height: 1.45; }
+        .alert-bar-note { margin: 10px 0 0; font-size: 13px; color: #94a3b8; }
+        .chart-signal-legend { margin: 8px 0 0; font-size: 12px; color: #94a3b8; }
+        .chart-signal-legend span { margin-right: 14px; white-space: nowrap; }
+        tr.signal-hit td { background-color: rgba(239, 68, 68, 0.08) !important; }
+        tr.signal-hit td:first-child { box-shadow: inset 3px 0 0 #ef4444; }
+        .signal-dots { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
+        .signal-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .signal-dot.whale { background: #8e44ad; }
+        .signal-dot.drain { background: #2c7fb8; }
+        .signal-dot.borrow { background: #d35400; }
+        .signal-dot.net_liquidity { background: #c0392b; }
         
         /* Filtre Butonları */
         .filter-container { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; margin-top: 20px; background: #0f172a; padding: 10px 15px; border-radius: 6px; border: 1px solid #334155; }
@@ -193,6 +221,7 @@
     <div id="statusBanner" class="status-banner" role="alert"></div>
 
     <div id="kpiContainer" class="kpi-container"></div>
+    <div id="alertBar"></div>
     
     <div id="dailyReportContainer"></div>
 
@@ -221,6 +250,7 @@
         <div class="chart-container"><canvas id="priceChart"></canvas></div>
         <div class="chart-container"><canvas id="sharesInvestorsChart"></canvas></div>
     </div>
+    <div id="chartSignalLegend" class="chart-signal-legend"></div>
 
     <div class="mini-charts-wrapper">
         <h2>🔍 İzole Varlık Trendleri (Mini Grafik Panosu)</h2>
@@ -322,9 +352,162 @@
         return { _metadata: { ...defaultMetadata }, records: [] };
     }
 
+    // Same round thresholds as signals.py / CASE_STUDY_2026_09.md (written after the event).
+    const WHALE_SHARE_DROP_PCT = -2.0;
+    const WHALE_INVESTOR_FLOOR_PCT = -0.5;
+    const BORROW_REPO_PCT = -5.0;
+    const DRAIN_WINDOW_DAYS = 20;
+    const DRAIN_SHARE_DROP_PCT = -15.0;
+    const DRAIN_PRICE_FLOOR_PCT = -3.0;
+    const SIGNAL_KEYS = ['whale', 'drain', 'borrow', 'net_liquidity'];
+    const SIGNAL_LABELS = {
+        whale: 'Balina günü',
+        drain: 'Pay erimesi',
+        borrow: 'Repo borçlanması',
+        net_liquidity: 'Net likidite < 0'
+    };
+    const SIGNAL_COLORS = {
+        whale: '#8e44ad',
+        drain: '#2c7fb8',
+        borrow: '#d35400',
+        net_liquidity: '#c0392b'
+    };
+
+    function trLower(text) {
+        return String(text).replace(/İ/g, 'i').replace(/I/g, 'i').toLowerCase();
+    }
+
+    function signalPct(next, prev) {
+        if (!prev) return 0;
+        return (next / prev - 1) * 100;
+    }
+
+    function liquidityRatioPct(varliklar) {
+        if (!varliklar) return null;
+        let total = 0;
+        for (const [name, value] of Object.entries(varliklar)) {
+            const lower = trLower(name);
+            if (!['repo', 'para piyasası', 'mevduat'].some(key => lower.includes(key))) continue;
+            total += Number(value) || 0;
+        }
+        return total;
+    }
+
+    function isSuspendedRow(row) {
+        return !row || !(Number(row.Fiyat) > 0);
+    }
+
+    function annotateFundSignals(records) {
+        records.forEach((row, index) => {
+            const prev = index ? records[index - 1] : null;
+            const window = index >= DRAIN_WINDOW_DAYS ? records[index - DRAIN_WINDOW_DAYS] : null;
+            const shareChg = prev ? signalPct(row.Pay || 0, prev.Pay || 0) : 0;
+            const investorChg = (prev && prev.Yatirimci && row.Yatirimci != null)
+                ? signalPct(row.Yatirimci, prev.Yatirimci) : 0;
+            const varliklar = row.Varliklar && Object.keys(row.Varliklar).length ? row.Varliklar : null;
+            const repo = varliklar && Object.prototype.hasOwnProperty.call(varliklar, 'Repo')
+                ? Number(varliklar.Repo) : null;
+            const netLiq = varliklar ? liquidityRatioPct(varliklar) : null;
+            const drainShare = window ? signalPct(row.Pay || 0, window.Pay || 0) : null;
+            const drainPrice = window ? signalPct(row.Fiyat || 0, window.Fiyat || 0) : null;
+            const whale = Boolean(prev) && shareChg <= WHALE_SHARE_DROP_PCT && investorChg >= WHALE_INVESTOR_FLOOR_PCT;
+            const drain = window != null
+                && drainShare <= DRAIN_SHARE_DROP_PCT
+                && drainPrice > DRAIN_PRICE_FLOOR_PCT;
+            const borrow = repo != null && repo <= BORROW_REPO_PCT;
+            const net_liquidity = netLiq != null && netLiq < 0;
+            row.signals = {
+                whale, drain, borrow, net_liquidity,
+                high_severity: (whale || drain) && (borrow || net_liquidity),
+                share_chg: shareChg,
+                investor_chg: investorChg,
+                drain_share_chg: drainShare,
+                drain_price_chg: drainPrice,
+                repo,
+                net_liquidity_pct: netLiq
+            };
+        });
+    }
+
+    function lastPricedIndex() {
+        for (let i = fundData.length - 1; i >= 0; i--) {
+            if (!isSuspendedRow(fundData[i])) return i;
+        }
+        return fundData.length ? fundData.length - 1 : -1;
+    }
+
+    function pricedRecords() {
+        return fundData.filter(row => !isSuspendedRow(row));
+    }
+
+    function formatSignedPct(value) {
+        if (value == null || Number.isNaN(Number(value))) return '—';
+        const number = Number(value);
+        const sign = number > 0 ? '+' : '';
+        return `${sign}${number.toFixed(2)}%`;
+    }
+
+    function signalHistory() {
+        const first = {};
+        const last = {};
+        pricedRecords().forEach(row => {
+            SIGNAL_KEYS.forEach(key => {
+                if (row.signals && row.signals[key]) {
+                    if (!first[key]) first[key] = row;
+                    last[key] = row;
+                }
+            });
+        });
+        return { first, last };
+    }
+
+    function signalValueText(key, row) {
+        const s = row.signals || {};
+        if (key === 'whale') {
+            return `Pay ${formatSignedPct(s.share_chg)}, yatırımcı ${formatSignedPct(s.investor_chg)} — eşik: pay ≤ −2%, yatırımcı ≥ −0,5%`;
+        }
+        if (key === 'drain') {
+            return `20 günde pay ${formatSignedPct(s.drain_share_chg)}, fiyat ${formatSignedPct(s.drain_price_chg)} — eşik: pay ≤ −15%, fiyat > −3%`;
+        }
+        if (key === 'borrow') {
+            return `Repo ${formatSignedPct(s.repo)} NAV — eşik ≤ −5%`;
+        }
+        return `Net likidite ${formatSignedPct(s.net_liquidity_pct)} — eşik < 0`;
+    }
+
+    function rowSignalKeys(row) {
+        return SIGNAL_KEYS.filter(key => row.signals && row.signals[key]);
+    }
+
+    const signalGuidePlugin = {
+        id: 'signalGuides',
+        afterDraw(chart) {
+            const dates = chart.options.plugins && chart.options.plugins.signalGuideDates;
+            if (!dates || !dates.length) return;
+            const { ctx, chartArea, scales } = chart;
+            const xScale = scales.x;
+            if (!xScale || !chartArea) return;
+            dates.forEach(({ index, color }) => {
+                if (index == null || index < 0) return;
+                const x = xScale.getPixelForValue(index);
+                if (x < chartArea.left || x > chartArea.right) return;
+                ctx.save();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([5, 4]);
+                ctx.beginPath();
+                ctx.moveTo(x, chartArea.top);
+                ctx.lineTo(x, chartArea.bottom);
+                ctx.stroke();
+                ctx.restore();
+            });
+        }
+    };
+
     function setFundDataFromDatabase(fundCode) {
         const entry = fundCode ? fundDatabase[fundCode] : null;
         fundData = entry && Array.isArray(entry.records) ? entry.records : [];
+        annotateFundSignals(fundData);
     }
 
     async function loadDatabase() {
@@ -654,6 +837,7 @@
 
     function renderAll() {
         renderKPIs();
+        renderAlerts();
         generateDailyReport();
         renderTable();
         renderCharts();
@@ -666,39 +850,126 @@
             return;
         }
 
-        // KPI her zaman en güncel durumu (tüm verinin sonunu) gösterir
-        const last = fundData[fundData.length - 1];
-        const prev = fundData.length > 1 ? fundData[fundData.length - 2] : null;
+        const latest = fundData[fundData.length - 1];
+        const halted = isSuspendedRow(latest);
+        const pricedIndex = lastPricedIndex();
+        const display = halted && pricedIndex >= 0 ? fundData[pricedIndex] : latest;
+        const prev = pricedIndex > 0 ? fundData[pricedIndex - 1] : (fundData.length > 1 ? fundData[fundData.length - 2] : null);
 
         let fDegisim = "";
         let pDegisim = "";
 
-        if (prev) {
-            let fDiff = last.Fiyat - prev.Fiyat;
+        if (!halted && prev && prev.Fiyat) {
+            let fDiff = display.Fiyat - prev.Fiyat;
             let fPct = (fDiff / prev.Fiyat) * 100;
             let fColor = fDiff > 0 ? '#22c55e' : '#ef4444';
             let fSign = fDiff > 0 ? '+' : '';
             fDegisim = `<span class="change-badge" style="color:${fColor}; font-size:14px; margin-left:8px;">(${fSign}%${fPct.toFixed(2)})</span>`;
+        }
 
-            let pDiff = last.Pay - prev.Pay;
+        if (prev && !halted) {
+            let pDiff = display.Pay - prev.Pay;
             let pColor = pDiff > 0 ? '#22c55e' : '#ef4444';
             let pSign = pDiff > 0 ? '+' : '';
             pDegisim = `<span class="change-badge" style="color:${pColor}; font-size:14px; margin-left:8px;">(${pSign}${pDiff.toLocaleString('tr-TR')} Adet)</span>`;
         }
 
-        kpiContainer.innerHTML = `
-            <div class="kpi-card" style="border-left-color: #3b82f6;">
+        const priceCard = halted
+            ? `<div class="kpi-card" style="border-left-color: #fbbf24;">
                 <div class="kpi-title">Güncel Fiyat</div>
-                <div class="kpi-value">${last.Fiyat.toLocaleString('tr-TR', {minimumFractionDigits:4})} ₺ ${fDegisim}</div>
-            </div>
+                <div class="kpi-value">Askıya alındı</div>
+            </div>`
+            : `<div class="kpi-card" style="border-left-color: #3b82f6;">
+                <div class="kpi-title">Güncel Fiyat</div>
+                <div class="kpi-value">${display.Fiyat.toLocaleString('tr-TR', {minimumFractionDigits:4})} ₺ ${fDegisim}</div>
+            </div>`;
+
+        const aumText = halted
+            ? '—'
+            : `${(display.ToplamDeger / 1000000000).toFixed(2)} Milyar ₺`;
+
+        kpiContainer.innerHTML = `
+            ${priceCard}
             <div class="kpi-card" style="border-left-color: #10b981;">
                 <div class="kpi-title">Toplam Fon Büyüklüğü</div>
-                <div class="kpi-value">${(last.ToplamDeger / 1000000000).toFixed(2)} Milyar ₺</div>
+                <div class="kpi-value">${aumText}</div>
             </div>
             <div class="kpi-card" style="border-left-color: #8b5cf6;">
                 <div class="kpi-title">Balina Radarı (Günlük Pay)</div>
-                <div class="kpi-value">${last.Pay.toLocaleString('tr-TR')} ${pDegisim}</div>
+                <div class="kpi-value">${halted ? '—' : `${display.Pay.toLocaleString('tr-TR')} ${pDegisim}`}</div>
             </div>
+        `;
+    }
+
+    function renderAlerts() {
+        const bar = document.getElementById('alertBar');
+        if (!bar) return;
+        if (fundData.length === 0) {
+            bar.innerHTML = '';
+            bar.className = 'alert-bar';
+            return;
+        }
+
+        const latest = fundData[fundData.length - 1];
+        const halted = isSuspendedRow(latest);
+        const pricedIndex = lastPricedIndex();
+        const signalRow = pricedIndex >= 0 ? fundData[pricedIndex] : latest;
+        const flags = signalRow.signals || {};
+        const { first, last } = signalHistory();
+        const firedKeys = SIGNAL_KEYS.filter(key => first[key]);
+        const stillOn = SIGNAL_KEYS.filter(key => flags[key]);
+
+        let severity = 'ok';
+        let title = 'Uyarı yok';
+        if (halted) {
+            severity = 'halted';
+            title = 'Askıya alındı / durduruldu';
+        } else if (flags.high_severity) {
+            severity = 'high';
+            title = 'Ağır uyarı: çıkış + tampon';
+        } else if (stillOn.length) {
+            severity = 'watch';
+            title = 'İzleme';
+        } else if (firedKeys.length) {
+            severity = 'watch';
+            title = 'Geçmiş uyarılar';
+        }
+
+        const items = firedKeys.map(key => {
+            const firstRow = first[key];
+            const lastRow = last[key];
+            const onNow = Boolean(flags[key]);
+            const when = firstRow.Tarih === lastRow.Tarih
+                ? `İlk (ve tek) ${firstRow.Tarih}`
+                : `İlk ${firstRow.Tarih} · son ${lastRow.Tarih}`;
+            const nowTag = onNow
+                ? `<span class="alert-item-now">son fiyatlı günde hâlâ açık (${signalRow.Tarih})</span>`
+                : `<span class="alert-item-when">son fiyatlı günde kapalı</span>`;
+            return `<li class="alert-item ${key}">
+                <div class="alert-item-head">
+                    <span class="alert-item-name">${SIGNAL_LABELS[key]}</span>
+                    <span class="alert-item-when">${when}</span>
+                    ${nowTag}
+                </div>
+                <p class="alert-item-detail"><strong>İlk ateş:</strong> ${signalValueText(key, firstRow)}</p>
+                ${firstRow.Tarih !== lastRow.Tarih ? `<p class="alert-item-detail"><strong>Son ateş:</strong> ${signalValueText(key, lastRow)}</p>` : ''}
+            </li>`;
+        }).join('');
+
+        let note;
+        if (halted) {
+            note = `TEFAS ${latest.Tarih} itibarıyla fiyat 0 yayınlıyor; fon o günden beri askıda. Yukarıdaki tarihler ve rakamlar son fiyatlı güne (${signalRow.Tarih}) kadar olan kayıttan. Yeni satır gelene kadar bu tablo durur.`;
+        } else if (!firedKeys.length) {
+            note = `Kurallar Eylül 2026 vaka çalışmasından sonra eklendi. ${signalRow.Tarih} itibarıyla eşik aşılmadı.`;
+        } else {
+            note = `Kesikli çizgiler grafikte her uyarının ilk gününü gösterir (seçili aralıkta görünüyorsa). Tabloda o günler işaretlenir.`;
+        }
+
+        bar.className = `alert-bar severity-${severity}`;
+        bar.innerHTML = `
+            <div class="alert-bar-title">${title}</div>
+            ${items ? `<ul class="alert-list">${items}</ul>` : ''}
+            <p class="alert-bar-note">${note}</p>
         `;
     }
 
@@ -779,6 +1050,12 @@
 
     function getChangeHTML(current, prev, calcPercentage = false) {
         if (prev === undefined || prev === null) return "";
+        if (calcPercentage && (Number(current) <= 0 || Number(prev) <= 0)) {
+            if (Number(current) <= 0) {
+                return `<span class="change-badge" style="color:#fbbf24; font-size:11px; margin-left:6px;">askı</span>`;
+            }
+            return "";
+        }
         let diff = current - prev;
         if (Math.abs(diff) < 0.0001) return `<span class="change-badge" style="color:#64748b; font-size:11px; margin-left:6px;">(0.00%)</span>`;
         
@@ -816,10 +1093,17 @@
             let payDegisim = prevRow ? getChangeHTML(row.Pay, prevRow.Pay, true) : "";
             let degerDegisim = prevRow ? getChangeHTML(row.ToplamDeger, prevRow.ToplamDeger, true) : "";
             let yatirimciDegisim = prevRow ? getChangeHTML(row.Yatirimci, prevRow.Yatirimci, true) : "";
+            const fiyatCell = isSuspendedRow(row)
+                ? `<td style="color:#fbbf24;">Askıya alındı ${fiyatDegisim}</td>`
+                : `<td style="color:#f8fafc;">${row.Fiyat.toLocaleString('tr-TR', {minimumFractionDigits:4})} ${fiyatDegisim}</td>`;
 
-            bodyHTML += `<tr>
-                <td><strong style="color:#f8fafc;">${row.Tarih}</strong></td>
-                <td style="color:#f8fafc;">${row.Fiyat.toLocaleString('tr-TR', {minimumFractionDigits:4})} ${fiyatDegisim}</td>
+            const hits = rowSignalKeys(row);
+            const dots = hits.map(key => `<span class="signal-dot ${key}" title="${SIGNAL_LABELS[key]}"></span>`).join('');
+            const rowClass = hits.length ? ' class="signal-hit"' : '';
+
+            bodyHTML += `<tr${rowClass}>
+                <td><strong style="color:#f8fafc;">${row.Tarih}</strong>${hits.length ? `<span class="signal-dots">${dots}</span>` : ''}</td>
+                ${fiyatCell}
                 <td style="color:#f8fafc;">${row.Pay.toLocaleString('tr-TR')} ${payDegisim}</td>
                 <td>${row.ToplamDeger.toLocaleString('tr-TR')} ${degerDegisim}</td>
                 <td style="color:#f8fafc;">${row.Yatirimci.toLocaleString('tr-TR')} ${yatirimciDegisim}</td>`;
@@ -872,12 +1156,30 @@
         }
 
         const labels = filtered.map(d => d.Tarih);
-        const commonOptions = { responsive: true, maintainAspectRatio: false };
+        const { first } = signalHistory();
+        const signalGuides = SIGNAL_KEYS.map(key => {
+            if (!first[key]) return null;
+            const index = filtered.findIndex(row => row.Tarih === first[key].Tarih);
+            return index >= 0 ? { index, color: SIGNAL_COLORS[key], key, date: first[key].Tarih } : null;
+        }).filter(Boolean);
+        const legend = document.getElementById('chartSignalLegend');
+        if (legend) {
+            legend.innerHTML = signalGuides.length
+                ? 'Kesikli dikey çizgi = uyarının <strong>ilk</strong> günü (seçili aralıkta): '
+                    + signalGuides.map(g => `<span style="color:${g.color}">${SIGNAL_LABELS[g.key]} ${g.date}</span>`).join('')
+                : 'Seçili aralıkta işaretlenecek ilk uyarı günü yok; üstteki listede tüm tarihçe durur.';
+        }
+        const commonOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { signalGuideDates: signalGuides }
+        };
 
         destroyChart('priceChart');
         const prices = filtered.map(d => d.Fiyat);
         charts['priceChart'] = new Chart(document.getElementById('priceChart'), {
             type: 'line',
+            plugins: [signalGuidePlugin],
             data: {
                 labels: labels,
                 datasets: [
@@ -885,12 +1187,13 @@
                     { label: '3-Günlük SMA', data: calculateSMA(prices, 3), borderColor: '#f59e0b', borderDash: [5, 5], tension: 0.1, pointRadius: 0 }
                 ]
             },
-            options: { ...commonOptions, plugins: { title: { display: true, text: 'Fiyat Trendi ve Hareketli Ortalama', color: '#f8fafc' } } }
+            options: { ...commonOptions, plugins: { ...commonOptions.plugins, title: { display: true, text: 'Fiyat Trendi ve Hareketli Ortalama', color: '#f8fafc' } } }
         });
 
         destroyChart('sharesInvestorsChart');
         charts['sharesInvestorsChart'] = new Chart(document.getElementById('sharesInvestorsChart'), {
-            type: 'line', 
+            type: 'line',
+            plugins: [signalGuidePlugin],
             data: {
                 labels: labels,
                 datasets: [
@@ -900,7 +1203,10 @@
             },
             options: {
                 ...commonOptions,
-                plugins: { title: { display: true, text: 'Balina Radarı: Pay Adedi vs Yatırımcı Uyumsuzluğu', color: '#f8fafc' } },
+                plugins: {
+                    ...commonOptions.plugins,
+                    title: { display: true, text: 'Balina Radarı: Pay Adedi vs Yatırımcı Uyumsuzluğu', color: '#f8fafc' }
+                },
                 scales: {
                     y: { type: 'linear', position: 'left' },
                     y1: { type: 'linear', position: 'right', grid: { drawOnChartArea: false } }
