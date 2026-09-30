@@ -1,9 +1,26 @@
 # KAP PDF Downloader & Parser (Sandbox)
 
-This sandbox is the holdings half of the same question the
-[terminal](../README.md) asks: **what does the fund actually hold, and
-how concentrated is it?** What those reports showed before September 2026
-is in the [case study](../case_study/CASE_STUDY_2026_09.md).
+TLY had years of positive returns by concentrating in a few names and
+absorbing the swings from cash; newer funds in the same style were
+already running the same structure. This sandbox opens that portfolio: **what the fund holds, what it buys and sells, and how
+concentrated those holdings are** — the structure while it still works,
+and the break when the liquid/illiquid mix goes. The
+[terminal](../README.md) is the daily series (whale radar, cash buffer).
+What those reports showed before September 2026 is in the
+[case study](../case_study/CASE_STUDY_2026_09.md).
+
+![Execution trace](img/report_overview.png)
+
+The HTML report opens with an execution trace: which KAP endpoints were
+called, which filings were kept or dropped, and how multi-fund trades
+were classified. Holdings parsed from a PDF:
+
+![Holdings table](img/report_holdings.png)
+
+And the estimated holdings since that baseline — weights, lot changes, BIST
+prices:
+
+![Portfolio evolution](img/report_evolution.png)
 
 Standalone, isolated module for downloading a Turkish investment fund's
 "Portfoy Dagilim Raporu" (Portfolio Allocation Report) PDF

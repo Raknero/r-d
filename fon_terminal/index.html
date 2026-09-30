@@ -143,13 +143,13 @@
         .change-badge { display: inline-block; vertical-align: middle; line-height: normal; white-space: nowrap; overflow: hidden; font-weight: bold; }
 
         /* Grafikler */
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }
-        .chart-container { background: #0f172a; padding: 15px; border: 1px solid #334155; border-radius: 8px; position: relative; height: 350px; }
+        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; min-width: 0; }
+        .chart-container { background: #0f172a; padding: 15px; border: 1px solid #334155; border-radius: 8px; position: relative; height: 350px; min-width: 0; overflow: hidden; }
         
         .mini-charts-wrapper { margin-top: 30px; padding-top: 20px; border-top: 2px solid #334155; }
         .mini-charts-wrapper h2 { color: #f8fafc; font-size: 20px; margin-top: 0; margin-bottom: 15px; }
-        .mini-charts-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; }
-        .mini-chart-box { background: #0f172a; padding: 10px; border: 1px solid #334155; border-radius: 6px; height: 240px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        .mini-charts-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; min-width: 0; }
+        .mini-chart-box { background: #0f172a; padding: 10px; border: 1px solid #334155; border-radius: 6px; height: 240px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); min-width: 0; overflow: hidden; position: relative; }
         
         @media (max-width: 1400px) { .mini-charts-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } }
         @media (max-width: 1200px) { .charts { grid-template-columns: 1fr; } }

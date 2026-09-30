@@ -1,8 +1,19 @@
 # TEFAS Fund Tracker (Fon Terminali) v5.3
 
-This project was built to answer one question about Turkish investment funds: **could this fund pay everyone who wants out at the same time?**
+This project was built to watch a handful of Turkish funds that were posting outsized, consistently positive returns — including funds I was invested in — and to see **when that would stop being sustainable.** TLY had years of that record. The others were newer: the same pattern, but for less than a year.
 
-The terminal measures the daily numbers that question needs — unit price, shares outstanding, investor count, AUM, and asset allocation — from TEFAS. Share-count change next to investor-count change is the whale radar; repo, reverse repo, money market and deposits are the cash buffer. Holdings and single-stock concentration come from the KAP pipeline in [`kap_pdf_downloader/`](kap_pdf_downloader/). What those numbers showed before September 2026 is in the [case study](case_study/CASE_STUDY_2026_09.md).
+They had grown very large, and their investor counts had exploded. Ranking them by return was not the work; they already led the market. A run of daily gains pulls in more inflows, which helps produce the next gain. Two signals show that mechanism failing:
+
+1. **Large holders leaving.** Investors who were in the fund before it opened to the broader public hold a disproportionate share of the units. If units outstanding fall while the investor count barely moves, informed capital is exiting. That is the whale radar: share-count change next to investor-count change.
+2. **The portfolio itself.** For as long as these funds worked, they were concentrated in a few equities and absorbed price swings from a large cash pool — both to support those names and to meet redemptions. That arrangement fails when the liquid/illiquid mix deteriorates, or when holdings concentrate in names the fund can no longer move.
+
+The terminal collects the daily TEFAS series (price, shares, investors, AUM, allocation). The KAP pipeline in [`kap_pdf_downloader/`](kap_pdf_downloader/) reads holdings, subsequent trades, and single-stock concentration. Together they exist to catch a break from either side, and to judge whether the same structure can keep delivering positive returns or is already failing. Return *level* was secondary in the software. The work was the timing.
+
+What those numbers showed before September 2026 is in the [case study](case_study/CASE_STUDY_2026_09.md).
+
+![Fon Terminali dashboard](img/terminal_dashboard.png)
+
+TLY as of 16.09.2026 — the last published TEFAS row before the suspension. Price and AUM still look fine; shares outstanding and reverse-repo are already falling. The charts below the table are the same window.
 
 It is a FastAPI app that keeps that database warm on every boot, lets you add or remove tracked funds from the UI, and collects TEFAS's public fund-list endpoints with retries and bulk fetches. A browser handshake runs only if those endpoints start demanding credentials again.
 
