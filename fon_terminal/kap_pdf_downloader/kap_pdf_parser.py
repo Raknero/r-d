@@ -1408,6 +1408,15 @@ def _render_delta_sections(delta_report: dict) -> str:
         if baseline_as_of
         else "taban raporun değerleme tarihinden bu yana"
     )
+    if current_aum_date:
+        price_cutoff = f"{current_aum_date} kapanışına"
+        price_sentence = (
+            f"Güncel Fiyat, {current_aum_date} tarihli (ya da o günden önceki son) BIST kapanışıdır; "
+            "bugünün seansı değildir."
+        )
+    else:
+        price_cutoff = "fiyat kesimine"
+        price_sentence = "Güncel Fiyat, çağıranın verdiği BIST kapanışıdır; canlı seans değildir."
 
     return f"""
   <div class="delta-sections">
@@ -1428,7 +1437,7 @@ def _render_delta_sections(delta_report: dict) -> str:
     </section>
     <section class="period-card">
       <h2>Hisse Bazlı Portföy Evrimi (Lot Değişim Özeti) <span class="badge">{len(updated_data)} kod</span></h2>
-      <p class="section-desc">{html.escape(baseline_ref)} Başlangıç Portföyü'nden bugüne, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Taban Tarihinden Beri Lot Değişimi (%)", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. "Güncel Fiyat" yfinance'ten (BIST, ".IS" son ekiyle) çekilen en son kapanış fiyatıdır; "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo "portföyün en büyük pozisyonu ne?" sorusuna göre Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
+      <p class="section-desc">{html.escape(baseline_ref)} Başlangıç Portföyü'nden {html.escape(price_cutoff)}, hisse başına net değişim: Başlangıç Lot + Kesinleşen Delta + Oransal Tahmini Delta = Güncel Tahmini Lot. "Taban Tarihinden Beri Lot Değişimi (%)", tek başına bir lot rakamının ("-69 milyon lot" gibi) neye göre büyük/küçük olduğunu, başlangıca oranlayarak gösterir; baseline'da hiç olmayıp yeni giren bir kod için oran hesaplanamayacağından "YENİ HİSSE" yazılır. "İşlem Tarihçesi" sütunundaki açılır listeye tıklayarak bu net toplamın hangi tarih(ler)de, kaç ayrı işlemle oluştuğunu görebilirsiniz. {price_sentence} "Güncel Ağırlık (%)" bu pozisyonun (Güncel Tahmini Lot × Güncel Fiyat) fonun toplam AUM'una oranıdır -- {aum_note} Fiyatı bulunamayan hisselerde (delist/yeni halka arz) bu iki sütun "-" gösterir ve ağırlık hesabına dahil edilmez. Tablo "portföyün en büyük pozisyonu ne?" sorusuna göre Güncel Ağırlık (%) azalan sırada listelenir; ağırlığı hesaplanamayan hisseler listenin sonunda, mutlak lot değişimine göre sıralanır.</p>
       <p class="section-alert"><strong>DİKKAT: Lot değişim oranları uzun vadeli yatırım trendini yansıtmaz. Bu oranlar sadece {html.escape(delta_window_note)} gerçekleşen işlemleri gösterir ve KAP her yeni portföy dağılım raporunu yayınladığında sıfırlanır -- bu raporlar artık HAFTALIK yayınlandığı için pencere birkaç gün kadar kısa olabilir. Raporun dönem etiketi ("Ağustos-2026" gibi) bir tarih DEĞİLDİR ve hesaplamada kullanılmaz; değerleme tarihi PDF'in kendi verisinden ölçülür.</strong></p>
       {evolution_html}
     </section>

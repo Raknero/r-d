@@ -166,17 +166,15 @@ def style_axis(ax):
 def fund_panel(fund, rows, summary, output_path, trades=None):
     rows = [r for r in rows if r["date"] >= CHART_START]
     dates = [r["date"] for r in rows]
-    fig, axes = plt.subplots(3, 1, figsize=(11, 10.2), sharex=True,
-                             gridspec_kw={"height_ratios": [1.35, 1, 1]})
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9.2), sharex=True,
+                             gridspec_kw={"height_ratios": [1.2, 1, 1]})
 
     ax = axes[0]
-    ax.plot(dates, index_series(rows, "price"), color="#222222", linewidth=2.2, label="Unit price")
-    ax.plot(dates, index_series(rows, "shares"), color="#2c7fb8", linewidth=2.2, label="Shares outstanding")
-    ax.set_ylabel(f"Price & shares\n({INDEX_BASE_DATE:%d.%m} = 100)")
-    ax.set_title(
-        f"{fund} — did the price still look fine while the fund was shrinking?",
-        loc="left", fontsize=12, pad=8,
-    )
+    ax.plot(dates, index_series(rows, "price"), color="#222222", linewidth=2.4, label="Unit price")
+    ax.plot(dates, index_series(rows, "shares"), color="#2c7fb8", linewidth=2.4, label="Shares outstanding")
+    ax.set_ylabel(f"Index, {INDEX_BASE_DATE:%d.%m} = 100")
+    ax.set_title(f"{fund}: price against the size of the fund", loc="left", fontsize=13, pad=6)
+    ax.legend(frameon=False, loc="best", fontsize=9)
 
     if trades:
         price_index = dict(zip(dates, index_series(rows, "price")))
@@ -199,52 +197,55 @@ def fund_panel(fund, rows, summary, output_path, trades=None):
 
     liquidity = [sane(r["net_liquidity"]) for r in rows]
     repo = [sane(r["repo"]) for r in rows]
-    ax.plot(dates, liquidity, color="#1a9850", linewidth=2.2, label="Net liquidity (cash-like minus repo)")
-    ax.plot(dates, repo, color="#d35400", linewidth=1.8, linestyle="--", label="Repo borrowing")
+    ax.fill_between(dates, liquidity, 0, where=[(v or 0) >= 0 for v in liquidity],
+                    color="#1a9850", alpha=0.18, interpolate=True)
+    ax.fill_between(dates, liquidity, 0, where=[(v or 0) < 0 for v in liquidity],
+                    color="#d73027", alpha=0.18, interpolate=True)
+    ax.plot(dates, liquidity, color="#1a9850", linewidth=2.4, label="Net liquidity")
     ax.axhline(0, color="#555555", linewidth=0.8)
-    ax.set_ylim(-60, 35)
+    # Scale to the buffer before the break. After NAV collapses the ratio
+    # stops meaning a cash cushion, and a shared axis hides the earlier cross.
+    pre_liq = [v for r, v in zip(rows, liquidity)
+               if v == v and (summary["collapse"] is None or r["date"] < summary["collapse"])]
+    if pre_liq:
+        lo, hi = min(min(pre_liq), 0.0), max(max(pre_liq), 0.0)
+        pad = max((hi - lo) * 0.22, 1.5)
+        ax.set_ylim(lo - pad, hi + pad)
     ax.set_ylabel("% of NAV")
-    ax.set_title("Was there still a cash buffer, or was the fund already borrowing?", loc="left", fontsize=10)
+    ax.set_title("Cash buffer. Green is above zero, red is below.", loc="left", fontsize=11)
+    ax.legend(frameon=False, loc="best", fontsize=9)
+    crossed = next((r["date"] for r in rows if r["net_liquidity"] is not None and r["net_liquidity"] < 0), None)
+    if crossed and (summary["collapse"] is None or crossed < summary["collapse"]):
+        ax.annotate(f"below zero\n{crossed:%d.%m}", (crossed, 0),
+                    textcoords="offset points", xytext=(8, 12), fontsize=8, color="#d73027")
 
     ax = axes[2]
     width = 0.4
-    ax.bar([d - timedelta(hours=5) for d in dates], [max(r["share_chg"], -20) for r in rows], width=width,
-           color="#2c7fb8", label="Shares outstanding, that day")
-    ax.bar([d + timedelta(hours=5) for d in dates], [max(r["investor_chg"], -20) for r in rows], width=width,
-           color="#bbbbbb", label="Investor count, that day")
+    ax.bar([d - timedelta(hours=5) for d in dates], [r["share_chg"] for r in rows], width=width,
+           color="#2c7fb8", label="Shares, that day")
+    ax.bar([d + timedelta(hours=5) for d in dates], [r["investor_chg"] for r in rows], width=width,
+           color="#bbbbbb", label="Investors, that day")
     ax.axhline(0, color="#555555", linewidth=0.8)
-    ax.set_ylim(-20, 8)
+    pre_chg = [r["share_chg"] for r in rows if summary["collapse"] is None or r["date"] < summary["collapse"]]
+    pre_chg += [r["investor_chg"] for r in rows if summary["collapse"] is None or r["date"] < summary["collapse"]]
+    if pre_chg:
+        lo, hi = min(min(pre_chg), 0.0), max(max(pre_chg), 0.0)
+        pad = max((hi - lo) * 0.18, 0.6)
+        ax.set_ylim(lo - pad, hi + pad)
     ax.set_ylabel("Daily %")
-    ax.set_title("Who left: a drop in shares with a flat investor count is large holders", loc="left", fontsize=10)
+    ax.set_title("Who left. A tall blue bar with a short grey bar is large holders.", loc="left", fontsize=11)
+    ax.legend(frameon=False, loc="lower left", fontsize=9)
 
+    break_day = summary["collapse"]
     for ax in axes:
         style_axis(ax)
-        for key, info in summary["signals"].items():
-            if info["first"] and info["first"] >= CHART_START:
-                ax.axvline(info["first"], color=SIGNAL_COLORS[key], linewidth=1.2, linestyle=":")
-        if summary["collapse"]:
-            ax.axvline(summary["collapse"], color="black", linewidth=1.8)
+        if break_day and break_day >= CHART_START:
+            ax.axvline(break_day, color="black", linewidth=1.4)
+    if break_day and break_day >= CHART_START:
+        axes[0].annotate(f"break {break_day:%d.%m}", (break_day, axes[0].get_ylim()[1]),
+                         textcoords="offset points", xytext=(6, -14), fontsize=8, color="black")
 
-    handles, labels = [], []
-    for ax in axes:
-        h, lbl = ax.get_legend_handles_labels()
-        handles += h
-        labels += lbl
-    for key, info in summary["signals"].items():
-        if info["first"] and info["first"] >= CHART_START:
-            handles.append(plt.Line2D([], [], color=SIGNAL_COLORS[key], linestyle=":", linewidth=1.5))
-            labels.append(f"First: {SIGNALS[key]} ({info['first']:%d.%m})")
-    if summary["collapse"]:
-        handles.append(plt.Line2D([], [], color="black", linewidth=1.8))
-        labels.append(f"Collapse / suspension ({summary['collapse']:%d.%m})")
-    fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=9, frameon=False)
-    fig.text(
-        0.5, 0.005,
-        "Dotted lines: first day each rule fired. Solid black: collapse or suspension. "
-        "Clipped axes hide NAV% that explode once the price is near zero.",
-        ha="center", fontsize=8, color="#555555",
-    )
-    fig.tight_layout(rect=(0, 0.14, 1, 0.99))
+    fig.tight_layout()
     fig.savefig(output_path, dpi=140)
     plt.close(fig)
 
@@ -317,9 +318,14 @@ def concentration_chart(snapshots, output_path):
         ax.bar(positions, values, width=width, label=label, color=palette[i % len(palette)])
     ax.set_xticks([x + width * (len(labels) - 1) / 2 for x in range(len(order))])
     ax.set_xticklabels(order)
-    ax.set_ylabel("% of fund NAV")
-    ax.set_title("TLY — how much sat in the largest names (from KAP reports, not TEFAS)", loc="left", fontsize=12)
-    ax.set_xlabel("Ticker")
+    ax.set_ylabel("% of TLY")
+    ax.set_title("TLY's largest names, one cluster per report", loc="left", fontsize=13)
+    ax.set_xlabel("")
+    for i, label in enumerate(labels):
+        values = [snapshots[label]["weights"].get(t, 0.0) for t in order]
+        for x, value in zip(range(len(order)), values):
+            if i == len(labels) - 1 and value >= 5:
+                ax.text(x + i * width, value + 0.6, f"{value:.0f}", ha="center", va="bottom", fontsize=8, color="#08306b")
     style = ax.spines
     style["top"].set_visible(False)
     style["right"].set_visible(False)

@@ -63,7 +63,7 @@ Usage:
         updated, resolved, unresolved = engine.apply_delta(
             baseline,
             start_date=dated.delta_start.isoformat(),
-            end_date=date.today().isoformat(),
+            end_date="2026-09-16",  # last session with a real NAV; not date.today()
         )
 """
 
@@ -1309,6 +1309,7 @@ def build_tefas_power_matrix(
     fund_codes: List[str],
     days_back: int = 30,
     execution_logs: Optional[List[Dict[str, str]]] = None,
+    as_of: Optional[date] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Adim 3 of the Shadow Portfolio pipeline: for every fund code passed
     in (typically the FULL `discover_related_funds()` output, not just the
@@ -1436,6 +1437,15 @@ def build_tefas_power_matrix(
             if not iso_date:
                 print(f"[UYARI] [{fund_code}] gecersiz/eksik tarih, bu gun atlaniyor: {record.get('Tarih')!r}")
                 continue
+            if as_of is not None and iso_date > as_of.isoformat():
+                continue
+            raw_price = record.get("Fiyat")
+            if raw_price is not None:
+                try:
+                    if float(raw_price) <= 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
 
             varliklar = record.get("Varliklar")
             if not varliklar:
@@ -1795,8 +1805,12 @@ if __name__ == "__main__":
     # after. That date is now MEASURED (see above) rather than assumed to
     # be a month end -- for a weekly report the month end is up to a week
     # too early, which re-applied trades the PDF already held.
+    # Last session these funds still published a real NAV. Later TEFAS
+    # rows are 0 and BIST names are halted; deltas, the power matrix,
+    # closes, and AUM all stop on this date.
+    LAST_OPERATING_SESSION = date(2026, 9, 16)
     start = baseline_dating.delta_start
-    end = date.today()
+    end = min(date.today(), LAST_OPERATING_SESSION)
     if start > end:
         raise SystemExit(
             f"Baseline veri tarihi ({_format_tr_date(baseline_end)}) bugunden sonra "
@@ -1873,8 +1887,14 @@ if __name__ == "__main__":
     # olabilir -- sadece global_baseline.keys() (PDF'i olanlar) yerine,
     # kesif asamasinin TAM listesi (related_funds_target_array) gonderilir,
     # boylece TEFAS kapsamı KAP PDF kapsamiyla gereksiz yere sinirlanmaz.
+    # Cover the delta window even when it starts more than 30 days before
+    # today, then drop every row after the last operating session.
+    tefas_days = max((date.today() - start).days + 3, 1)
     tefas_power_matrix = build_tefas_power_matrix(
-        related_funds_target_array, days_back=30, execution_logs=execution_logs
+        related_funds_target_array,
+        days_back=tefas_days,
+        execution_logs=execution_logs,
+        as_of=LAST_OPERATING_SESSION,
     )
 
     print("\n=== TEFAS Aktif Güç Matrisi Özeti ===")
@@ -1918,10 +1938,6 @@ if __name__ == "__main__":
         print(f"{code:8s}  Onceki: {before:>15,.2f}   Delta: {delta:>+15,.2f}   Sonraki: {after:>15,.2f}")
 
     print("\n=== Adım 6: Güncel BIST Fiyatları ve Portföy Ağırlığı (%) ===")
-    # Last session these funds still published a real NAV. After 16.09
-    # TEFAS prints 0 and many names are halted; live Yahoo closes are not
-    # the last operating book.
-    LAST_OPERATING_SESSION = date(2026, 9, 16)
     yf_symbols = [f"{code}.IS" for code in all_codes]
     _log_step(
         execution_logs,

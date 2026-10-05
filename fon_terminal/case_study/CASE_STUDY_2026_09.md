@@ -1,10 +1,12 @@
 # Case Study: The September 2026 Turkish Fund Run: What the Data Showed Before the Collapse
 
-This project was built to answer one question about Turkish investment funds:
-**could this fund pay everyone who wants out at the same time?** It watches for a
-fund that promises daily liquidity while holding illiquid, concentrated equity
-positions: a structure that works in calm markets and fails all at once in a
-panic.
+This project was built to see whether a fund that was posting outsized, steady
+gains could keep doing that, and to see the failure while there was still time
+to act. The break we weighted most, and the one we asked first, was liquidity:
+**could this fund pay everyone who wants out at the same time?** A fund can also
+stop working when its book concentrates in names it can no longer sell, or when
+the cash that absorbed those swings is gone. Paying everyone out is the sharp
+edge of that larger question, not the whole of it.
 
 In September 2026 that failure happened. This document replays the data the
 terminal had already collected, day by day, and asks what was visible and when.
@@ -51,13 +53,19 @@ The terminal on 16.09, last published TEFAS row before the halt — price and AU
 
 *Same dashboard as the terminal README. 17.09 (zero price / suspension, alerts) is in section 7.*
 
-The KAP HTML report, frozen at the last operating session. After 16.09, TEFAS prints 0 and BIST names are not a usable "current weight". These shots are from an earlier run (AUM header 26.08); they show the product, not a live post-liquidation refresh.
+The KAP frames are TLY's book with lots, closes and AUM stopped on 16.09.
 
 ![KAP execution trace](img/kap_report_overview.png)
 
+The filing is `2026_HB35`, published 09.09. The page says August; the header matches the TEFAS row of 07.09, so the holdings are the 04.09 close. Notices from 05.09 through 16.09 follow: 11 in total. Three were already inside the PDF and were dropped. Eight named several funds at once. None named TLY alone.
+
 ![KAP holdings](img/kap_report_holdings.png)
 
+Published lots, the top of the alphabetical list. DSTKF is 27,025,777, and that count is unchanged in the estimate.
+
 ![KAP portfolio evolution](img/kap_report_evolution.png)
+
+`Kesinleşen Delta` is a notice that names only TLY; this window has none. `Oransal Tahmini Delta` is TLY's share of a manager-level trade. TERA is one: 11,592,094 lots in the PDF plus 933,176 estimated. The price is the 16.09 BIST close, divided by the TEFAS row dated 16.09 (243.6 billion TL), which is still the 15.09 valuation. DSTKF at 27.2% is that limit-down close on the previous session's NAV. Section 4's 30.2% is the same lots at the 15.09 close. DSTKF closed −10% on 16.09, which is the gap. The frames are a short look. The uncut report is the [16.09 control PDF](../kap_pdf_downloader/parser_kontrol_raporu_2026-09-16.pdf). The pipeline write-up is the [KAP README](../kap_pdf_downloader/README.md).
 
 The two halves were developed separately on purpose: the terminal was the
 working system, the KAP pipeline was under active development, and the plan
@@ -99,7 +107,7 @@ they **were** written after the event; see the limitations in section 6.
 
 ![PHE panel](img/phe_panel.png)
 
-*Three stacked views, 16.07–collapse. Top: unit price vs shares outstanding (both indexed to 16.07 = 100). Middle: cash-like assets minus repo borrowing. Bottom: that day's change in shares (blue) vs investor count (grey). Dotted lines are the first fire of each rule; solid black is the break.*
+*Indexed to 16.07 = 100. Black is the unit price, blue is shares outstanding, and the vertical line is the break. Green above zero is the cash buffer, red is below. On the bottom, a tall blue bar beside a short grey bar is large holders leaving. The lower two panels are scaled to the days before the break; the crash stays on the price panel.*
 
 | 16.07 to 01.09 (last day before the price broke) | PHE | PBR |
 |---|---|---|
@@ -114,28 +122,29 @@ they **were** written after the event; see the limitations in section 6.
 - **From 05.08 both funds were borrowing to pay leavers.** By late August, PBR's
   equity exposure was 129% of NAV: leveraged, and the investors who stayed were
   financing the ones who left.
-- **Price was the last thing to move.** It stayed flat until 02.09, then fell
-  9-28% per day.
+- **Price was the last thing to move on PHE.** It stayed flat until 02.09, then fell
+  9-28% per day. PBR was already down 14.8% by that morning, mostly in the
+  previous week, and then fell with it.
 
 ![PBR panel](img/pbr_panel.png)
 
-*Same layout as PHE. Shares and liquidity moved for weeks; the unit price was the last series to break.*
+*Same three panels. By the vertical line the price was already down 14.8%. The line is the day that slide became the break.*
 
 ### 4.2 TLY: a rising price over a thinning cushion
 
 ![TLY panel](img/tly_panel.png)
 
-*Same three views. Price rises while shares fall and net liquidity crosses below zero on 08.09. The black line is 16.09 / suspension.*
+*Same three panels. The price keeps rising after the buffer turns red on 08.09. The vertical line is the suspension on 17.09. The last published price is the 16.09 row.*
 
 | 16.07 to 16.09 | TLY |
 |---|---|
 | Unit price | **+39.6%** |
 | Shares outstanding | **-23.7%** |
 | Investors | +5.4% |
-| Reverse repo (cash lent out) | 16.1% to 1.3% of NAV |
+| Reverse repo (cash lent out) | 16.1% to 2.7% of NAV |
 | Repo borrowing | -1.8% to -7.6% (the step came on 30.07) |
 | Net liquidity | +14.6% to -4.4% (**negative from 08.09**) |
-| Equity share of NAV | 62.8% to 88.4% |
+| Equity share of NAV | 62.8% to 87.4% |
 
 - **Whale days** (7 of them) appeared from 24.07. The clearest was **02.09**:
   shares fell 8.2% (about 22 billion TL) while the investor count fell by only
@@ -150,7 +159,7 @@ they **were** written after the event; see the limitations in section 6.
 
 ![TLY concentration](img/tly_concentration.png)
 
-*Each group is one KAP snapshot. Bars are that stock's weight in TLY's NAV. The last group is an estimate: 04.09 lots marked at 15.09 closes.*
+*Each cluster is one KAP snapshot, left to right from 31.07 to the 15.09 estimate. The number on the last bar is that name's weight in TLY.*
 
 | Snapshot | Top holding | Top 3 | Top 5 |
 |---|---|---|---|
@@ -159,10 +168,7 @@ they **were** written after the event; see the limitations in section 6.
 | 04.09 (weekly report) | DSTKF 25.3% | 60.0% | 74.9% |
 | 15.09 (04.09 lots at 15.09 closes, estimate) | DSTKF 30.2% | 67.6% | 85.6% |
 
-On 16.09 every one of the top five holdings closed at the -10% daily limit.
-Applying 16.09 closes to the 04.09 holdings gives an estimated one-day NAV
-change of **-8.8% to -9.4%**. With net liquidity below zero, the fund had no
-cash to meet redemptions and no buyers for what it would have to sell.
+On 16.09 every one of the top five holdings closed at the -10% daily limit. The section 2 frame divides those closes by this same NAV and prints DSTKF at 27.2%: the crash price on the previous session's assets. Applying the 16.09 closes to the 04.09 holdings gives an estimated one-day NAV change of **-8.8% to -9.4%**. Net liquidity was below zero: repo borrowing had passed the remaining reverse repo (2.7% of NAV that day) and deposits, and there were no buyers for what the fund would have to sell.
 
 ### 4.3 The manager was one position, not several
 
@@ -261,8 +267,9 @@ The alerting layer this case study argues for is small:
 
 1. Compute the four signals daily for every tracked fund and surface them on
    the dashboard next to price.
-2. Combine them: a drain or whale signal **with** falling or negative net
-   liquidity is the high-severity case; either one alone is a watch item.
+2. Combine them: a drain or whale signal **with** repo borrowing (at or below
+   −5% of NAV) or net liquidity below zero is the high-severity case; either
+   one alone is a watch item.
 3. Roll exposures up by **manager** and by **underlying stock** across funds,
    using the KAP pipeline's related-fund discovery and holdings.
 4. Track fund **status** (active, gated, suspended, in liquidation) and
@@ -304,6 +311,7 @@ already draining. I added to a fund with a shrinking buffer on 07.09. I
 And I stayed in TLY past 08.09, when its net liquidity turned negative. Because
 of the liquidation, the proceeds of my final orders have not been paid yet.
 
-The lesson I take is not that the signals were unclear. It is that a human
-reading dashboards is an unreliable alerting layer, especially through weeks
-when attention is elsewhere. That is the part of the system I am building next.
+The signals were readable. A human reading dashboards still missed them,
+especially through weeks when attention was elsewhere. The four rules are now
+on the terminal, written after this event. Still open is rolling the same book
+up by manager and by stock.

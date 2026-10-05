@@ -197,9 +197,13 @@ class ReportPeriod:
 
     @property
     def label(self) -> str:
-        """Human-readable form for logs, e.g. "2026 / 35. hafta (HB)"."""
+        """Human-readable form for logs, e.g. "2026 / HB 35".
+
+        The ordinal is KAP's filing number, not an ISO week, so the label
+        does not say "hafta".
+        """
         if self.code == PERIOD_CODE_WEEKLY:
-            return f"{self.year} / {self.ordinal}. hafta (HB)"
+            return f"{self.year} / HB {self.ordinal}"
         if self.code == PERIOD_CODE_MONTHLY:
             return f"{self.year} / {self.ordinal:02d}. ay (AB)"
         return f"{self.year} / dönem {self.ordinal} ({self.code})"

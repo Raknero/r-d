@@ -13,214 +13,98 @@ What those numbers showed before September 2026 is in the [case study](case_stud
 
 ![Fon Terminali dashboard](img/terminal_dashboard.png)
 
-TLY as of 16.09.2026 — the last published TEFAS row before the suspension. Price and AUM still look fine; shares outstanding and reverse-repo are already falling. The charts below the table are the same window.
+TLY as of 16.09.2026 — the last published TEFAS row before the suspension. Price and AUM still look fine; shares outstanding and reverse-repo are already falling. The charts below the table are the same window. The terminal keeps collecting after that date and shows a price of 0 as suspended. The KAP book does not: lots, closes, and AUM stop on 16.09.
+
+That row is the fund from the outside. The book at the 16.09 close is the [KAP pipeline](kap_pdf_downloader/README.md). What the series showed before the break is in the [case study](case_study/CASE_STUDY_2026_09.md).
 
 **Alerting (added after the September 2026 case study).** The dashboard applies the four rules from that write-up — whale day, share drain while price is flat (`Pay erimesi`), repo borrowing, net liquidity below zero — with the first/last fire date and the values that crossed the threshold. Outflow plus a thinning buffer is the high-severity case. A published price of 0 is shown as suspended, not as −100%.
 
-It is a FastAPI app that keeps that database warm on every boot, lets you add or remove tracked funds from the UI, and collects TEFAS's public fund-list endpoints with retries and bulk fetches. A browser handshake runs only if those endpoints start demanding credentials again.
+The terminal is a FastAPI app. One process serves the dashboard and the API, keeps `fund_database.json` warm, and adds or hides funds from the UI. The rules above are attached in memory when that file is served; they are not written back into it.
 
-## Project Overview & Architecture Evolution
+What a refresh does now is the next section. The four diagnoses that produced it are in [Decisions that stuck](#decisions-that-stuck).
 
-**Legacy vs. v4.0 Architecture:**
-Earlier iterations of this pipeline relied on traditional HTML DOM parsing. While functional, DOM scraping is inherently fragile and susceptible to unannounced frontend UI updates by TEFAS. v4.0 represented a complete architectural shift: moving away from UI-dependent scraping to a direct API interception model. By targeting the underlying Next.js backend, this evolution drastically reduced execution time, eliminated DOM-related breakage, and established a resilient, enterprise-grade data pipeline.
+## How a refresh works
 
-**v4.0 vs. v5.0 Architecture:**
-v4.0 was still a static dashboard: a human had to run `data_scraper.py` on a schedule, hardcode which fund codes to track, and manually edit the frontend to add a new one. v5.0 removes the human from that loop. `main.py` wraps the same scraping engine in a FastAPI application whose `lifespan` hook re-warms the database on every startup, a set of REST endpoints let the dashboard add, hide, or permanently delete funds at runtime, and a soft-delete metadata layer keeps a fund's history alive in the background even after it's removed from the UI, so re-adding it later never starts from a blank slate.
+TEFAS publishes fund-level price, NAV, shares, investors, and asset mix, but not as a documented public API. The two list endpoints this pipeline reads (`fonGnlBlgSiraliGetirDosya`, `dagilimSiraliGetirT`) accept an optional fund filter. Leaving the filter off returns every fund in one response. The result is grouped locally. A routine refresh is one request per endpoint, whether you track 3 funds or 300. Distribution is paged, so a wider window adds pages; it does not add a request per fund.
 
-**v5.0 vs. v5.1 Architecture:**
-v5.0 paid the full cost of a Playwright handshake on *every single* `scrape_and_update()` call — once per API request, once per fund in the startup scan, every time. v5.1 introduces an in-memory token cache: the Bearer token and cookies captured by Playwright are reused across calls for as long as TEFAS keeps accepting them, so adding a fund from the UI or running the 15-day background scan no longer launches a fresh browser unless it truly has to. A smart-retry layer backstops this cache — if TEFAS ever responds with `401`/`403` mid-run, the stale token is invalidated, a new one is acquired transparently, and the failed request is retried once, all without interrupting the scrape.
+The date range starts from the newest day already stored, plus a 3-day overlap so TEFAS revisions are still picked up. A fund with no rows gets a 30-day backfill. The window is capped at 60 days (`MAX_BULK_WINDOW_DAYS`); a longer gap is caught up over consecutive runs. If the fetched prices match what is stored, the run skips the distribution request and the write. An empty allocation on a fund that otherwise publishes a breakdown is fetched again. A fund that never publishes one stays `-`.
 
-**v5.1 vs. v5.2 Architecture:**
-v5.1 could fetch data efficiently but had no answer for being *throttled*. It scraped funds in database insertion order, treated TEFAS's `HTTP 429` as a permanent failure, and only refreshed at boot — so once the fund count grew past what TEFAS would serve in one burst, the funds at the end of the list were dropped from every run and quietly served days-old numbers. v5.2 makes the pipeline survive its own rate limit: `429` is retried with exponential backoff instead of abandoned, funds are scanned stalest-first so a throttled tail rotates rather than starving, the startup scan moved off the request path so the dashboard is never held hostage to it, and an hourly refresh keeps a long-running server current instead of drifting until the next restart.
+A short window over the whole list uses that bulk response. A 30-day backfill of one or two funds uses two direct requests, because bulk's cost follows the width of the date range. A code missing from a good bulk response takes the same direct path. A failed bulk request leaves each fund's `last_scraped_date` unchanged and waits for the next run.
 
-**v5.2 vs. v5.3 Architecture:**
-v5.2 survived rate limiting but still paid for it, because its cost grew linearly with the portfolio: 2 requests per fund, plus a 5-9s pause between each, so a dozen funds took ~110s and 30 funds would have taken well over ten minutes once throttling was factored in. v5.3 removes fund count from the cost equation entirely. Both TEFAS endpoints turn out to be "list funds, optionally filtered" queries, so dropping the filter returns *every* fund in one response — a refresh is now ~2 requests whether you track 3 funds or 300. On top of that the date window is derived from what's already stored instead of blindly re-requesting 30 days, a run that finds nothing new skips the write entirely, and requests no longer launch a browser at all. A full 11-fund refresh that needs both endpoints went from **~110s to 4.8s**; a no-op hourly run is **~0.8s and 1 request**. Adding a fund from the UI went from **~17s to 0.7s**.
+Funds on the dashboard are included in the startup scan and in the hourly loop (`REFRESH_INTERVAL_MINUTES`). These endpoints are end-of-day; there is no intraday price here. The page is served immediately; the scrape runs beside it. A hidden fund with background tracking is included every 15 days (`BACKGROUND_TRACKING_INTERVAL_DAYS`). Hiding keeps the series. Permanent delete removes it. Re-adding fills about the last 30 days.
 
-TEFAS publishes fund-level data (price, NAV, shares, and asset distribution), which is highly valuable for portfolio tracking. However, it is not exposed through a stable public API. The core engineering challenges overcome in this architecture include:
+Requests go out over plain HTTPS. The Playwright handshake runs only when a call comes back `401` or `403`.
 
-### 1. Collecting from TEFAS without a documented API
+From the UI: "+ Yeni Fon Ekle" calls `POST /api/add-fund`. The "×" on a tab hides the fund, with the option to keep background tracking. A management panel lists hidden funds and can delete one for good. Charts are Chart.js.
 
-**The Problem:** TEFAS publishes the data but not a stable public API. Fund detail pages sit behind an F5 challenge, and the Next.js `/api/funds/` routes used to require a dynamically issued `Authorization: Bearer` token plus browser cookies.
+## Timeline
 
-**Through v5.2:** a headless `Playwright` handshake loaded the page just long enough to intercept a real outgoing API request, captured the token and cookies, and injected them into a `requests.Session()` for the actual POSTs.
-
-**Since v5.3:** the two list endpoints this pipeline actually reads (`fonGnlBlgSiraliGetirDosya`, `dagilimSiraliGetirT`) return full data over plain HTTPS — no token, no cookies, no User-Agent (verified 5/5). The handshake is no longer on the data path; it stays wired to the `401`/`403` branch in `post_tefas_endpoint` so it can run again if TEFAS starts demanding credentials. See section 8.
-
-### 2. Handling Incomplete Financial Data
-
-**The Problem:** Financial data pipelines are inherently subject to upstream API inconsistencies. Due to platform-side quirks on TEFAS, certain funds (like `YAS`) do not return distribution data through the bulk search endpoints. Additionally, funds (like `PHE`) might temporarily liquidate a specific asset, causing that asset's key to vanish from the API response entirely.
-
-**The Solution:** Engineered a robust validation layer. If an asset is completely sold off and missing from the payload, the UI intelligently defaults to `0.00%` rather than throwing `undefined` errors. For funds that return empty datasets from the TEFAS API, a dual-layer logging system alerts the backend terminal, while the frontend gracefully displays a muted `-` indicator to maintain visual UI harmony without breaking the application state.
-
-TEFAS also often publishes a day's price/AUM *before* that day's allocation. The first scrape of such a day used to store an empty `Varliklar` and the no-op guard then treated the empty dict as a finished fetch, so TLY could sit on the dashboard with a current price and `-` in every allocation column. Empty allocation on a fund that otherwise publishes a breakdown is now a hole: the next refresh retries distribution, and the daily-moves report no longer interprets a missing breakdown as a 0% sell-off.
-
-### 3. Sub-Pixel Rendering & UI Matrix
-
-**The Problem:** The complex data table required simultaneous vertical and horizontal sticky scrolling, which caused browser sub-pixel rendering issues resulting in text "bleeding" through headers.
-
-**The Solution:** Designed a precise CSS matrix using strict `z-index` layering (up to `z-index: 20` for origin corners) and a `top: -1px` physical offset to crush the browser rendering gap, achieving a flawless, zero-bleed scrolling experience in a dark-mode environment.
-
-### 4. Blocking Playwright on an Async Event Loop
-
-**The Problem:** `scrape_and_update()` uses Playwright's *synchronous* API internally. FastAPI's `lifespan` and request handlers run on an `asyncio` event loop, and Playwright's sync API raises immediately if it's ever invoked directly on that loop's thread.
-
-**The Solution:** Every call site that needs to await the scraper from async code (the `lifespan` startup hook) runs it via `asyncio.to_thread()`, moving the blocking Playwright/`requests` pipeline onto a worker thread. The scraper's implementation itself is untouched; only the boundary between async FastAPI code and the sync scraping engine was made non-blocking.
-
-### 5. Removing a Fund Without Losing Its History
-
-**The Problem:** Once a fund's history has been scraped, deleting it outright to "clean up" the dashboard means starting from zero if it's ever added back — and TEFAS doesn't let you fetch arbitrarily old data on demand.
-
-**The Solution:** Every fund entry carries a `_metadata` object (`show_on_ui`, `background_tracking`, `last_scraped_date`) alongside its `records`. Removing a fund from the UI is a soft delete: its tab disappears, but if the user opts to keep tracking it, the `lifespan` startup hook quietly re-scrapes it once every 15 days so its history stays current without wasting a scrape on every single restart. A separate, explicit "Management Panel" and hard-delete endpoint exist for genuinely permanent removal.
-
-### 6. Repeated Playwright Handshakes on Every Scrape
-
-**The Problem:** `scrape_and_update()` is called far more often than once — every `POST /api/add-fund` request and every fund in the 15-day background scan each triggered their own independent Playwright handshake, even though the previously captured token was often still perfectly valid. This wasted seconds per call and increased the surface area for bot detection.
-
-**The Solution:** Implemented a **token caching and smart retry** layer. A module-level cache holds the last captured `Authorization` header and cookie string; `get_session_credentials()` returns this cache directly whenever it's populated, skipping Playwright entirely. If TEFAS ever rejects the session with a `401`/`403` (e.g. it expired between calls), `post_tefas_endpoint()` clears the cache, re-triggers the Playwright handshake for a fresh token, rebuilds the `requests.Session`, and retries the failed request exactly once — transparently, with no change to `scrape_and_update()`'s public signature. `fetch_endpoint_data()` is only the per-fund wrapper around that function.
-
-**Measured impact:** benchmarked directly against the live TEFAS site (headless browser launch + navigation + token capture) — a cold handshake takes ~5.9-6.8s, while a cached lookup completes in well under 1ms. That is a **~100% reduction (roughly 6 seconds saved) on every `scrape_and_update()` call that can reuse an already-valid session** — e.g. every fund after the first in a multi-fund background scan, or any `/api/add-fund` request that arrives while a previous token is still valid.
-
-> **Since v5.3:** with the handshake off the data path (section 8), that ~6s is saved on the *first* call too, not just subsequent ones. The cache still backs the fallback path, so it matters again the moment TEFAS starts requiring credentials.
-
-### 7. Newly Added Funds Silently Stuck on Days-Old Data
-
-**The Problem:** Funds added most recently showed data 2-3 days stale while the funds added first were always current, and the console never showed the stale ones being fetched. Four separate defects compounded into that one symptom:
-
-1. **TEFAS rate limiting was treated as a permanent failure.** TEFAS answers a burst of API calls with `HTTP 429`. Measured 2026-09-04: scraping 11 funds back-to-back succeeded for the first 6, then returned `429` for *every* remaining request. The POST helper lumped `429` in with all other non-`200` codes — log once, give up — so those funds were dropped from the run and reported as `No general info retrieved (invalid fund code, or no data for this period)`, blaming the fund code for what was really a throttle.
-2. **The scan always ran in database insertion order.** Since a newly added fund is appended last, the *same* trailing funds hit the rate limit on every single run. The failure wasn't random — it was pinned to whichever funds were added most recently.
-3. **The startup scan blocked all traffic.** `lifespan` awaited the full scrape before serving a single request (~4-5s per fund, so about a minute for a dozen funds). Interrupting that wait — the natural reaction to a dashboard that won't load — left the tail of the list unscraped.
-4. **The Playwright handshake opened a *visible* browser window.** `acquire_session_credentials()` had `headless=False` set in source — deliberately, since watching the challenge get solved is the only practical way to debug a handshake failure, but it then applied to *every* caller, including the server's background refresh where no one is watching the window. Closing it raised `Page.wait_for_timeout: Target page, context or browser has been closed` from inside the poll loop, and because the handshake happens *before* the fund loop, that exception escaped past `scrape_and_update()`'s per-fund `try/except` — one closed window meant **zero** funds refreshed, with nothing in the logs pointing at the window as the cause.
-
-**The Solution:**
-
-- `429` is now handled as the transient condition it is: retried with exponential backoff (20s → 40s → 80s, capped at 120s), honoring TEFAS's `Retry-After` header when present, with jitter so parallel retries don't re-synchronize into another burst. The inter-fund pause also rose from 1.5-3.5s to 5-9s, which keeps a full multi-fund run under the limiter instead of tripping it halfway through.
-- Scan order is now **stalest-first** (never-scraped funds first, then oldest `last_scraped_date`). An interrupted or throttled run still leaves *some* tail unfinished, but that tail now rotates: whatever missed out is first in line next time, so no fund can starve indefinitely.
-- The startup scan runs as a **background task**. The dashboard serves immediately (measured 0.04s for `index.html`, 0.18s for `fund_database.json`) with whatever is already on disk, and each fund's numbers update as its scrape lands — removing the incentive to interrupt.
-- A **periodic refresh** repeats the same scan every 60 minutes for as long as the server runs, so data no longer ages until someone restarts the process. 60 minutes is deliberate rather than aggressive: TEFAS only publishes end-of-day values on these endpoints, so polling faster would buy no fresher numbers while pushing the run back toward the limiter.
-- The visible browser became a **toggle instead of a source edit**: headless by default (`HANDSHAKE_HEADLESS`), with `TEFAS_HANDSHAKE_HEADLESS=0` (or `headless=False` passed directly) restoring the window for debugging. Independently of the default, any browser-level failure now degrades to the normal "no token" path, so closing the window mid-handshake costs that one handshake rather than the whole run.
-- Every scrape path (startup, periodic, `/api/add-fund`) is serialized behind one lock, since each is a read-modify-write cycle over the same JSON file and interleaving them could let one overwrite funds the other had just saved.
-
-### 8. Refresh Cost Growing Linearly With The Portfolio
-
-**The Problem:** Even with rate limiting handled, a refresh sent 2 requests per fund and paused 5-9s between funds. That made the *portfolio size* the bottleneck: 11 funds took ~110s, and 30 funds would mean 60 requests and ~200s of deliberate waiting before counting the 429 backoffs a burst that size provokes. Scaling the dashboard meant scaling the wait.
-
-**The Solution:** Both endpoints were already being called with fund-list-shaped payloads — `dagilimSiraliGetirT` takes `aramaMetni` plus `basSira`/`bitSira` pagination — which was the clue that they are "list funds, optionally filtered" queries rather than per-fund lookups. Dropping the fund filter returns every fund on TEFAS in a single response. Measured 2026-09-09 against the live site:
-
-| Request | Funds returned | Time |
+| Date | | What changed |
 |---|---|---|
-| `fonGnlBlgSiraliGetirDosya`, `fonKod=None`, 1 day | 2041 | 0.45s |
-| `dagilimSiraliGetirT`, `aramaMetni=None`, 1 day | 1907 | 1.01s |
+| 21.07.2026 | | First commit. A browser loaded the fund page and the numbers were parsed out of the HTML. |
+| 23.07.2026 | v4.0 | Moved onto the Next.js fund endpoints. Still a script, with fund codes hardcoded. |
+| 25.07.2026 | v5.0 | FastAPI serves the dashboard. Funds are added and removed from the UI, and a hidden fund can keep its rows. |
+| 27.07.2026 | v5.1 | Cached the browser handshake. Before this, every scrape launched Chromium. |
+| 04.09.2026 | v5.2 | `429` is retried, the scan walks stalest-first, startup no longer blocks the page, and a running server refreshes hourly. A run still sent two requests per fund and waited 5–9s between funds. |
+| 09.09.2026 | v5.3 | Both endpoints return every fund when the filter is omitted. Refresh cost stopped growing with the portfolio. The ordinary path no longer opens a browser. |
+| 14.09.2026 | | An empty allocation on a day that already has a price is fetched again, instead of being stored as finished. |
+| 30.09.2026 | | The four case-study rules appear on the dashboard. Written after the event. |
 
-The response is grouped by fund code locally (`group_records_by_fund`), so **request count no longer depends on how many funds are tracked** — and it is markedly gentler on TEFAS, since a refresh that used to send 60 requests now sends 2. Four things compound with it:
+## Decisions that stuck
 
-- **Incremental date window** (`compute_scrape_window`): the range is derived from the newest date already stored, plus a 3-day overlap so TEFAS's after-the-fact revisions are still picked up. A fund with no history at all still triggers the full 30-day backfill — and gets it from the same request that serves everyone else.
-- **No-op guard** (`general_map_has_changes`): TEFAS publishes once a day, so most hourly refreshes have nothing to do. A run whose fetched values match what's stored skips the distribution request *and* the database write, costing 1 request and ~0.8s instead of rewriting a 250 KB JSON file for nothing. New dates, revised values, and a date whose `Varliklar` is empty on a fund that otherwise publishes a breakdown all count as changes -- those runs take the second (distribution) request too. TEFAS often ships price/AUM first and the allocation later the same day, and treating that empty dict as "already fetched" used to freeze the hole in (TLY 14.09.2026 sat on the dashboard with price but no allocation until this distinction was added).
-- **No browser in the happy path** (`build_plain_session`): these endpoints return full data over plain HTTPS with no Bearer token, no cookies, and no User-Agent (verified 5/5 attempts). The Playwright handshake — ~4-6s and the largest leftover session-setup cost — is no longer on the data path at all. It remains wired to the `401`/`403` branch in `post_tefas_endpoint`, so if TEFAS starts demanding credentials again the handshake happens automatically and the request is retried.
-- **One write per run** instead of one per fund, since per-fund work is now pure in-memory merging.
+**Rate limit, misread as a bad fund code.** The funds added last showed numbers 2–3 days old, and the log said `No general info retrieved (invalid fund code, or no data for this period)`. Measured 2026-09-04: the first 6 of 11 funds succeeded, then every remaining call was `HTTP 429`. The client treated `429` like any other non-200 and dropped the fund. The scan always walked the file in insertion order, so the same tail missed every run. Retrying `429` (backoff, `Retry-After`, jitter) and scanning stalest-first stopped that starvation. The pause between funds was the intermediate fix; request count still grew with the list, which is the next decision.
 
-**Bulk is chosen per run, not always** (`should_use_bulk`). Its cost scales with the *width of the date window* (it downloads every fund for every day in range), while the targeted path's scales with the *number of funds*. So one fund needing a 30-day backfill — exactly what `/api/add-fund` does — is ~25x faster asked for directly (0.63s vs 15.74s), and that case falls back to targeted requests. A fund missing from an otherwise successful bulk response takes the same targeted path.
+**Empty allocation stored as a finished day.** TLY sat on the dashboard with a current price and `-` in every allocation column. TEFAS often publishes price and AUM before that day's breakdown. The first scrape wrote an empty `Varliklar`, and the no-op guard treated that empty dict as a completed fetch, so later hourly runs skipped it. (TLY on 14.09.2026 stayed in that state until the distinction was added.) `YAS` never returns distribution at all, so a dash there is a missing series, not a one-day hole.
 
-If the bulk request fails outright, the run deliberately does **not** fan out into per-fund requests: that would fire the exact 60-request burst bulk fetching exists to avoid, against an endpoint that just refused us. Every fund keeps its old `last_scraped_date`, so stalest-first ordering puts them at the front of the next run.
+**Cost that scaled with the portfolio.** After the limiter was handled, 11 funds still took about 110s: two requests each, plus 5–9s between funds. Thirty funds would have been 60 requests and minutes of waiting before the `429`s a burst that size provokes. Both calls were already list-shaped (`aramaMetni`, `basSira`/`bitSira` on the distribution endpoint). Dropping the fund filter returns the whole board. Measured 2026-09-09: general info for 2041 funds in 0.45s, distribution for 1907 funds in 1.01s. A fully stale refresh of the tracked set went from ~110s and 22 requests to **4.8s and 4 requests**. A quiet hour is **0.8s and 1 request**. Adding one fund from the UI went from ~17s to **0.7s**.
 
-**Measured impact (2026-09-09, 11-12 tracked funds):**
+**History longer than the backfill.** Deleting a fund's rows to tidy the dashboard threw away every day older than the fresh-add backfill above. Hiding the fund keeps that longer series on disk and refreshes it on the 15-day cadence. Permanent delete is the action that actually drops the earlier months.
 
-| Operation | Before | After |
-|---|---|---|
-| Full refresh, all funds stale | ~110s, 22 requests | **4.8s, 4 requests** |
-| Hourly refresh, nothing new | ~110s, 22 requests | **0.8s, 1 request** |
-| Hourly refresh, empty `Varliklar` hole | (same as full) | **2 requests** (price match, allocation retry) |
-| Add one fund from the UI | ~17s (or ~10s + handshake) | **0.7s, 2 requests** |
-| Projected: 30 funds, nothing new | 60 requests, 10+ min with throttling | **0.8s, 1 request** |
+## Tech stack
 
-## Key Features
+- **Backend:** Python 3.9+, FastAPI, Uvicorn, Requests, Playwright (only if TEFAS starts requiring a browser session again)
+- **Frontend:** HTML5, vanilla JavaScript, CSS
+- **Charts:** Chart.js (CDN)
 
-**Backend (`main.py` + `data_scraper.py`)**
-- **Full-stack FastAPI app:** a single process serves the dashboard (`index.html`, `fund_database.json`) and exposes the management API — no separate static file server is needed.
-- **Case-study alerts (`signals.py`):** the four rules in the September 2026 write-up, computed in memory when serving `fund_database.json` (never written back). Added after that analysis, not before.
-- **Self-updating lifespan:** on every boot, automatically re-scrapes every fund currently shown on the UI, plus any hidden/background-tracked fund whose last scrape is 15+ days old — in the background, so the dashboard serves traffic immediately instead of waiting out the scan.
-- **Hourly background refresh:** a periodic task repeats that same scan every 60 minutes (`REFRESH_INTERVAL_MINUTES`) for as long as the server runs, so a long-lived process never drifts onto stale data between restarts.
-- **Bulk fetching — cost independent of portfolio size:** one all-funds request per endpoint serves every tracked fund, so a refresh that needs both endpoints costs ~2 requests whether 3 funds or 300 are tracked (measured 4.8s / 4 requests for a stale 11-fund window; ~0.8s / 1 request when the no-op guard skips distribution).
-- **Incremental windows & no-op guard:** the date range is derived from what's already stored rather than always re-requesting 30 days, and a run that finds nothing new skips both the distribution request and the database write. An empty `Varliklar` on a fund that otherwise publishes a breakdown is a hole (price/AUM often arrives first), not a reason to skip.
-- **Per-run strategy choice:** bulk fetching is used when it's actually cheaper; a wide backfill window for one or two funds (i.e. `/api/add-fund`) is served by targeted requests instead, which is ~25x faster for that case.
-- **Browser-free happy path:** the bulk endpoints need no token, so the ~4-6s Playwright handshake only runs if TEFAS answers `401`/`403` — keeping it as a fallback rather than a per-run cost.
-- **Stalest-first scan order & rate-limit backoff:** funds are refreshed oldest-data-first, and TEFAS `429` responses are retried with exponential backoff (honoring `Retry-After`) rather than dropping the fund — so a throttled run recovers instead of permanently starving whichever funds sit at the end of the list.
-- **Fund lifecycle endpoints:** `POST /api/add-fund`, `POST /api/remove-fund` (soft delete, with optional continued background tracking), and `DELETE /api/hard-delete-fund` (permanent removal).
-- **Modular scraping engine:** `scrape_and_update(fund_list)` is the single entry point shared by the CLI, the lifespan hook, and every API endpoint — the collection path itself never changes based on who's calling it.
-- **Token caching & smart retry:** the Playwright-captured session (Bearer token + cookies) is cached in memory and reused across calls — measured at ~100% faster (~6s saved) per call versus repeating the handshake — while a `401`/`403` from TEFAS automatically invalidates the cache, re-authenticates, and retries the failed request once, no manual restarts required.
-- **Historical Merging:** Upserts into `fund_database.json`, grouping by fund code. Existing dates are overwritten (auto-correcting TEFAS revisions), and new dates are inserted chronologically.
-- **Fault Tolerance:** Per-fund error handling ensures one fund's failure doesn't abort the entire run.
-
-**Frontend (`index.html`)**
-- **Zero-touch fund management:** a "+ Yeni Fon Ekle" control lets users add a new fund directly from the UI — it POSTs to `/api/add-fund`, shows a loading state, and drops the new tab in without a full page reload.
-- **Fund removal & background tracking:** an unobtrusive "×" on each tab opens a confirmation dialog to either keep tracking a fund quietly in the background or delete it permanently.
-- **Management Panel:** a dedicated modal listing every background-tracked (UI-hidden) fund with its last scrape date, each with a one-click permanent delete action.
-- **Alerting (post-crisis):** whale day, pay erimesi (share drain while price is flat), repo borrowing, and net liquidity < 0, with fire dates and crossing values, the same rules as the [case study](case_study/CASE_STUDY_2026_09.md). Combined outflow + buffer is high severity. A zero price is "suspended", not −100%. Added after the September 2026 analysis.
-- **Interactive Visuals:** Zebra-striped data tables with day-over-day change badges, price trend charts, and asset-type mini-charts via Chart.js.
-
-## Tech Stack
-
-- **Backend:** Python 3.9+, FastAPI, Uvicorn, Playwright, Requests
-- **Frontend:** HTML5, Vanilla JavaScript, CSS3 (Custom Dark Theme)
-- **Charting:** Chart.js (via CDN)
-
-## Installation & Usage
-
-### Prerequisites
-
-- Python 3.9+
-
-### Setup
+## Installation
 
 ```bash
-git clone <repository-url>
-cd fon_terminal
+git clone https://github.com/Raknero/r-d.git
+cd r-d/fon_terminal
 
-# Create and activate virtual environment
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-(Note: `playwright install chromium` downloads the headless browser binary for the handshake; it runs only once per environment).
-
-### Running the Application
+`playwright install chromium` is for the `401`/`403` fallback. Ordinary refreshes do not launch it.
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Then open `http://127.0.0.1:8000` in your browser. The dashboard is served **immediately**; the startup refresh runs in the background and each fund's numbers update as its scrape lands. Watch the terminal for `[STARTUP]` log lines to follow progress, and `[REFRESH]` lines for the hourly re-scrape that follows.
+Open `http://127.0.0.1:8000`. The page loads from whatever is already in `fund_database.json`; the startup scan follows in the background (`[STARTUP]` in the terminal, then `[REFRESH]` once an hour). There is no fund list to hardcode. The file is what gets scanned, and new codes are added from the UI.
 
-There is no fund list to hardcode anywhere: whatever is tracked in `fund_database.json` is what gets scanned, and new funds are added from the UI itself via "+ Yeni Fon Ekle" (which calls `POST /api/add-fund` and scrapes that fund immediately).
-
-### Standalone CLI Scraper (optional)
-
-`data_scraper.py` still works as a direct script for scheduled/cron-style runs independent of the web server. A run costs ~2 requests and a second or two regardless of how many funds are tracked, so it's cheap enough for a frequent cron entry:
+`data_scraper.py` is the same `scrape_and_update()` without the server:
 
 ```bash
-# Refresh every fund tracked in fund_database.json
-python data_scraper.py
-
-# ...or just specific ones
-python data_scraper.py TLY PHE
+python data_scraper.py          # every fund in fund_database.json
+python data_scraper.py TLY PHE  # just these
 ```
 
-With no arguments it refreshes **every fund in `fund_database.json`**; pass fund codes to narrow it. (Before this was fixed, the CLI had a hardcoded `["TLY", "PHE", "YAS"]` list that silently rotted as funds were added and removed through the UI — it refreshed three funds, one of which no longer existed in the database, while leaving every other tracked fund untouched.) Both the CLI and the FastAPI app call the exact same `scrape_and_update()` function, so behavior is identical either way.
+## API
 
-## API Reference
+| Endpoint | Method | Body / params | Description |
+|---|---|---|---|
+| `/api/add-fund` | `POST` | `{"fund_code": "MAC"}` | Scrapes the code and shows it on the dashboard. |
+| `/api/remove-fund` | `POST` | `{"fund_code": "MAC", "keep_tracking": true}` | Hides the tab. `keep_tracking: true` leaves a 15-day background refresh. |
+| `/api/hard-delete-fund` | `DELETE` | `?fund_code=MAC` | Deletes the fund and its history. |
 
-| Endpoint | Method | Body / Params | Description |
-|----------|--------|----------------|--------------|
-| `/api/add-fund` | `POST` | `{"fund_code": "MAC"}` | Scrapes and adds a brand-new fund, visible on the UI immediately. |
-| `/api/remove-fund` | `POST` | `{"fund_code": "MAC", "keep_tracking": true}` | Hides a fund from the UI. If `keep_tracking` is `true`, it's still refreshed every 15 days in the background. |
-| `/api/hard-delete-fund` | `DELETE` | `?fund_code=MAC` | Permanently deletes a fund and its entire history. Cannot be undone. |
+## Data schema
 
-## Data Schema
-
-Each run merges the latest data into `fund_database.json`, grouped by fund code. Every fund entry carries a `_metadata` object (visibility/tracking state) alongside its chronologically-ordered `records`:
+`fund_database.json` is local and gitignored. Each fund has `_metadata` plus chronological `records`. Files from before v5.0 are a bare list of records; the first load upgrades them in place.
 
 ```json
 {
@@ -228,40 +112,33 @@ Each run merges the latest data into `fund_database.json`, grouped by fund code.
         "_metadata": {
             "show_on_ui": true,
             "background_tracking": false,
-            "last_scraped_date": "2026-07-25"
+            "last_scraped_date": "2026-09-16"
         },
         "records": [
-            { "Tarih": "21.07.2026", "Fiyat": 7510.647463, "...": "..." }
+            { "Tarih": "16.09.2026", "Fiyat": 10308.9671, "...": "..." }
         ]
     }
 }
 ```
 
 | Field | Description |
-|-------|-------------|
-| `_metadata.show_on_ui` | Whether the fund's tab is shown on the dashboard. |
-| `_metadata.background_tracking` | Whether a hidden fund is still refreshed periodically (every 15 days). |
-| `_metadata.last_scraped_date` | Date (`YYYY-MM-DD`) of the fund's most recent successful scrape. |
-| `records[].Tarih` | Record date (DD.MM.YYYY) |
-| `records[].Fiyat` | Unit price on that date |
-| `records[].Pay` | Shares outstanding |
-| `records[].ToplamDeger` | Total fund net asset value (TRY) |
-| `records[].Yatirimci` | Number of investors |
-| `records[].Varliklar` | Asset type → allocation percentage (can include negative values, e.g. net Repo; keys are translated from raw TEFAS abbreviations to full names) |
+|---|---|
+| `_metadata.show_on_ui` | Tab visible on the dashboard. |
+| `_metadata.background_tracking` | Hidden fund still refreshed every 15 days. |
+| `_metadata.last_scraped_date` | Last successful scrape (`YYYY-MM-DD`). |
+| `records[].Tarih` | Row date (`DD.MM.YYYY`). A row dated T is published on T and valued at the previous business day's close. |
+| `records[].Fiyat` | Unit price. `0` means suspended. |
+| `records[].Pay` | Shares outstanding. |
+| `records[].ToplamDeger` | Total net asset value (TRY). |
+| `records[].Yatirimci` | Investor count. |
+| `records[].Varliklar` | Asset type → percent of NAV. Repo can be negative. Keys are the full TEFAS names, not the raw abbreviations. |
 
-**Backward compatibility:** database files created before v5.0 store a bare list of records per fund (no `_metadata`). These are detected and transparently upgraded to the shape above the first time they're loaded — no manual migration step is required, and no historical data is lost.
+## Troubleshooting
 
-## Troubleshooting & Notes
-
-- **Handshake Errors:** If you see `[ERROR] [HANDSHAKE] Failed to capture Authorization token`, TEFAS may have updated its flow. Check `acquire_session_credentials()` in `data_scraper.py`.
-- **401/403 Status:** Handled automatically in `post_tefas_endpoint()`. It clears the cached token, re-runs the Playwright handshake, and retries the failed request once. Watch for `[CACHE] Cached TEFAS session token invalidated.` in the logs to confirm this happened; if the retry also fails, the fund is skipped for that run and the underlying error is reported.
-- **`[CACHE] Reusing cached TEFAS session token...`:** this is expected and desirable — it means `scrape_and_update()` reused an already-valid session instead of launching a new browser. The cache lives only for the lifetime of the running process, so it resets on every server restart.
-- **`HTTP 429` in the logs:** TEFAS is rate limiting, not rejecting the fund. `post_tefas_endpoint()` retries with exponential backoff (honoring `Retry-After`); look for `HTTP 429 (TEFAS istek limiti) dondurdu; Ns beklenip tekrar denenecek`. If a fund still fails after the retry budget, it keeps its old `last_scraped_date` and therefore moves to the **front** of the next scan, so it recovers on the following run. Restarting the server repeatedly in quick succession is the fastest way to provoke this, since each boot kicks off a full scan.
-- **Watching the handshake (or an unexpected browser window):** set `TEFAS_HANDSHAKE_HEADLESS=0` to make the Chromium window visible — useful if TEFAS changes its challenge or starts blocking headless fingerprints. If a window appears when you didn't ask for one, that variable is set in your environment. Closing it mid-handshake is now safe for the process (the failure is caught and reported like any other missing token), but that handshake still yields no credentials, so the funds it was serving are skipped until the next scan.
-- **Frequent restarts during development:** the startup scan runs on every boot. The happy path does not launch a browser; a handshake runs only if TEFAS answers `401`/`403`. Each boot still re-scans every fund, which is the main way to hit the `429` limiter locally.
-- **`[BULK] ... zaten guncel; dagilim istegi ve veritabani yazimi atlandi`:** the no-op guard working as intended — TEFAS had nothing new, so the run cost 1 request and skipped the write. Expected on most hourly refreshes **when there is no empty-`Varliklar` hole**. If the latest table row shows `-` in every allocation column while older rows are filled, price/AUM arrived first: that hole now retriggers the distribution request (2 requests that hour) for funds that publish a breakdown.
-- **`[TEK FON] [XXX] ...`:** the targeted (non-bulk) path. Either a deliberate choice (a wide backfill window for one or two funds, where targeted is cheaper) or a fallback for a fund missing from the bulk response; the message says which.
-- **Distribution data looks empty for older dates:** the distribution endpoint pages via `basSira`/`bitSira`, and an all-funds query over a wide window exceeds one page (~2000 rows per day, so a 30-day pull needs ~47k rows). `fetch_bulk_distribution` pages until a short page proves the end was reached — without that, truncated rows are indistinguishable in the logs from a genuinely qualified/closed fund publishing no breakdown. If you see the `Dagilim verisi N sayfada bitmedi` warning, the window is too wide; lower `MAX_BULK_WINDOW_DAYS` or raise `BULK_MAX_PAGES`.
-- **Tuning the intervals:** the 15-day background-tracking cadence is `BACKGROUND_TRACKING_INTERVAL_DAYS` and the hourly re-scrape is `REFRESH_INTERVAL_MINUTES`, both in `main.py`. Rate-limit backoff and the inter-fund pause (targeted path only) are `RATE_LIMIT_*` and `INTER_FUND_DELAY_RANGE_SECONDS` in `data_scraper.py`; bulk sizing/strategy is `BULK_*` in the same file.
-- **No intraday data:** TEFAS publishes **end-of-day** values on these endpoints. There is no live/intraday feed to scrape, so "right now" pricing is not obtainable — the freshest possible figure is the current day's published value.
-- **Data Privacy:** `fund_database.json` is treated as local environment data and is ignored via `.gitignore`.
+- **`[ERROR] [HANDSHAKE] Failed to capture Authorization token`.** The fallback browser session did not capture a Bearer token. TEFAS may have changed that flow; see `acquire_session_credentials()` in `data_scraper.py`. Set `TEFAS_HANDSHAKE_HEADLESS=0` to watch the window. Closing it fails that handshake only.
+- **`401`/`403`.** `post_tefas_endpoint()` drops the cached session, runs the handshake, and retries that request once. Look for `[CACHE] Cached TEFAS session token invalidated.` `[CACHE] Reusing cached TEFAS session token` means a later call on the fallback path skipped a new browser launch. The cache lasts for the process.
+- **`HTTP 429`.** TEFAS is limiting, not rejecting the code. The client backs off (and honors `Retry-After`). A fund that still fails keeps its old `last_scraped_date`, so the next scan reaches it. Restarting the server in a tight loop is the quickest way to provoke this locally: each boot starts a scan.
+- **`[BULK] ... zaten guncel; dagilim istegi ve veritabani yazimi atlandi`.** Nothing new; 1 request, no write. If the latest row is `-` in every allocation column and older rows are filled, that hole pulls distribution (2 requests that hour) for funds that publish a breakdown.
+- **`[TEK FON]`.** Direct requests: either one or two funds over a wide window, where that is cheaper, or a code missing from the bulk body. The log line says which.
+- **`Dagilim verisi N sayfada bitmedi`.** An all-funds distribution pull is ~2000 rows per day, so a wide window needs several pages (`basSira`/`bitSira`). Lower `MAX_BULK_WINDOW_DAYS` or raise `BULK_MAX_PAGES` in `data_scraper.py`.
+- **Intervals.** 15-day hidden-fund cadence and the hourly loop are `BACKGROUND_TRACKING_INTERVAL_DAYS` and `REFRESH_INTERVAL_MINUTES` in `main.py`. Backoff and the pause on the direct path are `RATE_LIMIT_*` and `INTER_FUND_DELAY_RANGE_SECONDS` in `data_scraper.py`.

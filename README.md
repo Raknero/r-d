@@ -4,7 +4,7 @@ Working software and notes around Turkish investment funds. Almost everything li
 
 | | |
 |---|---|
-| [**Terminal**](fon_terminal/README.md) | Daily TEFAS series: whale radar, cash buffer, alerts. Screenshot is TLY on **16.09.2026**, the last published row before the halt. |
+| [**Terminal**](fon_terminal/README.md) | Daily TEFAS series: whale radar, cash buffer. Screenshot is TLY on **16.09.2026**, the last published row before the halt. The four alert rules were added on 30.09, after the event. |
 | [**KAP pipeline**](fon_terminal/kap_pdf_downloader/README.md) | Holdings, subsequent trades, concentration. Market weights freeze at **16.09.2026** — later TEFAS/BIST prints are not the last operating book. |
 | [**Case study**](fon_terminal/case_study/CASE_STUDY_2026_09.md) | What those series showed before the September 2026 run. |
 
