@@ -1,6 +1,6 @@
 # r-d
 
-Working software and notes around Turkish investment funds. Almost everything lives in [`fon_terminal/`](fon_terminal/) — start there, not at this folder listing.
+A handful of Turkish funds were posting outsized, steady gains. This repo watches whether that could continue: a daily TEFAS series (price, shares, cash buffer) and a KAP book (holdings and concentration). On **16.09.2026**, the last published TEFAS row before the halt, the unit price still looked fine.
 
 | | |
 |---|---|
