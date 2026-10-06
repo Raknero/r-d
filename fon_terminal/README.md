@@ -81,6 +81,13 @@ playwright install chromium
 
 `playwright install chromium` is for the `401`/`403` fallback. Ordinary refreshes do not launch it.
 
+The signal tests import the KAP package, so that install needs both requirement files:
+
+```bash
+pip install -r requirements.txt -r kap_pdf_downloader/requirements.txt
+python -m unittest discover -s tests
+```
+
 ```bash
 uvicorn main:app --reload
 ```

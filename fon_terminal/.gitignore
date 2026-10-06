@@ -8,3 +8,8 @@ INTERNAL_ARCHITECTURE.md
 
 # Vaka çalışmasının kişisel sürümü (işlemler, tutarlar, KAP PDF kopyaları) -- Git ile ASLA takip edilmemeli.
 case_study/private/
+
+# Kökte duran indirme artıkları. kap_pdf_downloader/.gitignore yalnızca o klasörün içinde geçerlidir.
+*_pdfs/
+parser_kontrol_raporu.html
+kap_pdf_downloader/_run_full.txt

@@ -535,9 +535,8 @@ class KAPPdfDownloader:
     # --- Session setup -------------------------------------------------------
 
     def _build_session(self) -> requests.Session:
-        """Builds a requests.Session with realistic browser-like headers
-        (rather than requests' default User-Agent) so KAP's bot detection
-        doesn't reject scripted requests, and reuses the same TCP
+        """Builds a requests.Session with a browser User-Agent instead of
+        requests' default python-requests token, and reuses the same TCP
         connection across every call in a run.
         """
         session = requests.Session()

@@ -366,18 +366,10 @@ def acquire_session_credentials(
             print(f"[HANDSHAKE] Captured Bearer token from request to: {request.url}")
 
     with sync_playwright() as playwright:
-        # --disable-blink-features=AutomationControlled strips the basic
-        # `navigator.webdriver` flag that WAFs/bot-detection scripts check
-        # for, since Playwright/Chromium sets it by default.
-        browser = playwright.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        browser = playwright.chromium.launch(headless=headless)
         try:
-            # A hardcoded, standard Windows Chrome User-Agent (instead of
-            # Playwright's default Headless/Chromium UA string) plus
-            # realistic Accept-Language headers, to better blend in with a
-            # genuine browser session and avoid fingerprinting.
+            # Playwright's default UA says HeadlessChrome. Use the same
+            # User-Agent as the requests session.
             context = browser.new_context(
                 user_agent=USER_AGENT,
                 extra_http_headers={

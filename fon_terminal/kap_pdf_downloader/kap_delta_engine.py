@@ -1339,7 +1339,7 @@ def build_tefas_power_matrix(
     kap_pdf_downloader sandbox that intentionally breaks its own "no
     dependency on fon_terminal's own modules" rule (see this folder's
     README) -- TEFAS AUM/distribution data only exists in that module, and
-    duplicating its Playwright WAF-bypass logic here would be a
+    duplicating its Playwright session handshake here would be a
     maintenance hazard, not an improvement. The import is done lazily
     (only when this function actually runs) via a `sys.path` bridge to the
     parent `fon_terminal/` directory, so nothing else in this sandbox
